@@ -1551,7 +1551,7 @@ object ImageProcessingEngine {
 
         val stabilizeBoost = if (stabilizeEnabled) 1.09f else 1f
         val baseFit = min(targetW.toFloat() / sourceFrame.width, targetH.toFloat() / sourceFrame.height)
-        val effScale = baseFit * cropZoom.coerceIn(0.6f, 2.5f) * transitionScale * keyframeScale * stabilizeBoost
+        val effScale = baseFit * cropZoom.coerceIn(0.25f, 3.0f) * transitionScale * keyframeScale * stabilizeBoost
         val drawW = sourceFrame.width * effScale
         val drawH = sourceFrame.height * effScale
         val cx = targetW / 2f + (panX + keyframeX) * targetW * 0.4f + transitionOffsetX * targetW

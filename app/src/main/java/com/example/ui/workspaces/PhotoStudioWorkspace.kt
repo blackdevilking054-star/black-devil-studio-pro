@@ -8,11 +8,15 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -31,9 +35,12 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AddPhotoAlternate
 import androidx.compose.material.icons.filled.ArrowDownward
 import androidx.compose.material.icons.filled.ArrowUpward
+import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.AutoFixHigh
 import androidx.compose.material.icons.filled.BlurOn
 import androidx.compose.material.icons.filled.Category
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Crop
 import androidx.compose.material.icons.filled.Delete
@@ -52,6 +59,7 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
@@ -59,14 +67,18 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.pointer.pointerInput
@@ -75,11 +87,14 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.zIndex
 import com.example.model.BlendModeKind
 import com.example.model.CollageLayoutKind
 import com.example.model.LayerKind
 import com.example.model.PhotoCanvasPreset
 import com.example.model.PhotoExportFormat
+import com.example.model.PhotoLayer
 import com.example.model.PhotoStudioState
 import com.example.model.StudioShapeKind
 import com.example.model.ToneCurvePreset
@@ -104,7 +119,12 @@ import com.example.ui.theme.StudioSurfaceElevated
 import com.example.ui.theme.TextPrimary
 import com.example.ui.theme.TextSecondary
 import com.example.viewmodel.XonixStudioViewModel
+import kotlin.math.PI
+import kotlin.math.abs
+import kotlin.math.cos
+import kotlin.math.min
 import kotlin.math.roundToInt
+import kotlin.math.sin
 
 private enum class PhotoToolTab {
     CANVAS, LAYERS, CUTOUT, BLUR, ADJUST, TEXT_SHAPES
@@ -208,87 +228,322 @@ fun PhotoStudioWorkspace(
         else -> StudioBorder.copy(alpha = 0.6f)
     }
 
+    var editingTextLayerId by remember { mutableStateOf<String?>(null) }
+    var inlineDraftText by remember { mutableStateOf("") }
+    var inlineOriginalText by remember { mutableStateOf("") }
+    val currentPhotoState by rememberUpdatedState(state)
+
+    fun openInlineTextEditor(layer: PhotoLayer) {
+        if (layer.kind != LayerKind.TEXT && layer.kind != LayerKind.STICKER) return
+        val initial = if (layer.kind == LayerKind.STICKER) layer.stickerSymbol else layer.text
+        editingTextLayerId = layer.id
+        inlineDraftText = initial
+        inlineOriginalText = initial
+    }
+
     Column(
         modifier = modifier
             .fillMaxSize()
             .background(OledBlack)
     ) {
         // =========================================================================
-        // 1. TOP 52%: PURE, CLEAN PHOTO PREVIEW STAGE
+        // 1. TOP 52%: INTERACTIVE TOUCH-LAYER PHOTO PREVIEW STAGE
         // =========================================================================
         Box(
             modifier = Modifier
                 .fillMaxWidth()
                 .weight(0.52f)
                 .background(OledBlack)
+                .clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null
+                ) {
+                    if (editingTextLayerId != null) {
+                        editingTextLayerId = null
+                    } else if (!isBrushActive) {
+                        viewModel.clearPhotoLayerSelection()
+                    }
+                }
                 .padding(horizontal = 14.dp, vertical = 10.dp),
             contentAlignment = Alignment.Center
         ) {
             val aspect = (state.canvasWidth.toFloat() / state.canvasHeight.toFloat().coerceAtLeast(1f))
                 .coerceIn(0.56f, 1.9f)
 
-            Box(
+            // Unclipped aspect-ratio stage so layer corner & 1-finger rotate handles never clip
+            BoxWithConstraints(
                 modifier = Modifier
                     .fillMaxHeight()
-                    .aspectRatio(aspect, matchHeightConstraintsFirst = true)
-                    .clip(RoundedCornerShape(14.dp))
-                    .background(DeepObsidian)
-                    .border(
-                        width = if (isBrushActive) 2.dp else 0.5.dp,
-                        color = brushBorderColor,
-                        shape = RoundedCornerShape(14.dp)
-                    )
-                    .pointerInput(isBrushActive, state.selectedLayerId) {
-                        if (isBrushActive) {
-                            detectDragGestures { change, _ ->
-                                if (size.width <= 0 || size.height <= 0) return@detectDragGestures
-                                change.consume()
-                                val nx = (change.position.x / size.width).coerceIn(0f, 1f)
-                                val ny = (change.position.y / size.height).coerceIn(0f, 1f)
-                                viewModel.handlePhotoBrushTouch(nx, ny)
-                            }
-                        } else {
-                            detectTransformGestures { _, pan, zoom, rotation ->
-                                if (size.width <= 0 || size.height <= 0) return@detectTransformGestures
-                                viewModel.transformSelectedPhotoLayer(
-                                    dxNorm = pan.x / size.width,
-                                    dyNorm = pan.y / size.height,
-                                    zoomFactor = zoom,
-                                    rotationDeltaDeg = rotation
+                    .aspectRatio(aspect, matchHeightConstraintsFirst = true),
+                contentAlignment = Alignment.Center
+            ) {
+                val canvasW = constraints.maxWidth.coerceAtLeast(1)
+                val canvasH = constraints.maxHeight.coerceAtLeast(1)
+                val minCanvasEdge = min(canvasW, canvasH).coerceAtLeast(1).toFloat()
+
+                // Clipped preview surface with Brush gestures OR Tap/Double-Tap layer selection + 2-finger pinch/rotate
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(DeepObsidian)
+                        .border(
+                            width = if (isBrushActive) 2.dp else 0.5.dp,
+                            color = brushBorderColor,
+                            shape = RoundedCornerShape(14.dp)
+                        )
+                        .pointerInput(isBrushActive) {
+                            if (isBrushActive) {
+                                detectDragGestures { change, _ ->
+                                    if (size.width <= 0 || size.height <= 0) return@detectDragGestures
+                                    change.consume()
+                                    val nx = (change.position.x / size.width).coerceIn(0f, 1f)
+                                    val ny = (change.position.y / size.height).coerceIn(0f, 1f)
+                                    viewModel.handlePhotoBrushTouch(nx, ny)
+                                }
+                            } else {
+                                detectTapGestures(
+                                    onTap = { tapOffset ->
+                                        val hit = hitTestPhotoLayer(
+                                            layers = currentPhotoState.layers,
+                                            tapX = tapOffset.x,
+                                            tapY = tapOffset.y,
+                                            canvasW = size.width.coerceAtLeast(1),
+                                            canvasH = size.height.coerceAtLeast(1)
+                                        )
+                                        if (hit != null) {
+                                            viewModel.selectPhotoLayer(hit.id)
+                                        } else {
+                                            viewModel.clearPhotoLayerSelection()
+                                        }
+                                    },
+                                    onDoubleTap = { tapOffset ->
+                                        val hit = hitTestPhotoLayer(
+                                            layers = currentPhotoState.layers,
+                                            tapX = tapOffset.x,
+                                            tapY = tapOffset.y,
+                                            canvasW = size.width.coerceAtLeast(1),
+                                            canvasH = size.height.coerceAtLeast(1)
+                                        )
+                                        if (hit != null) {
+                                            viewModel.selectPhotoLayer(hit.id)
+                                            if (hit.kind == LayerKind.TEXT || hit.kind == LayerKind.STICKER) {
+                                                openInlineTextEditor(hit)
+                                            }
+                                        }
+                                    }
                                 )
                             }
                         }
-                    },
-                contentAlignment = Alignment.Center
-            ) {
-                if (previewBitmap != null && !previewBitmap.isRecycled) {
-                    Image(
-                        bitmap = previewBitmap.asImageBitmap(),
-                        contentDescription = "Photo Preview",
-                        contentScale = ContentScale.Fit,
-                        modifier = Modifier.fillMaxSize()
-                    )
+                        .pointerInput(isBrushActive, "photo_canvas_multitouch") {
+                            if (!isBrushActive) {
+                                detectTransformGestures { _, pan, zoom, rotation ->
+                                    if (size.width <= 0 || size.height <= 0) return@detectTransformGestures
+                                    if (currentPhotoState.selectedLayerId == null) return@detectTransformGestures
+                                    viewModel.transformSelectedPhotoLayer(
+                                        dxNorm = pan.x / size.width,
+                                        dyNorm = pan.y / size.height,
+                                        zoomFactor = zoom,
+                                        rotationDeltaDeg = rotation
+                                    )
+                                }
+                            }
+                        }
+                        .testTag("photo_preview_canvas"),
+                    contentAlignment = Alignment.Center
+                ) {
+                    if (previewBitmap != null && !previewBitmap.isRecycled) {
+                        Image(
+                            bitmap = previewBitmap.asImageBitmap(),
+                            contentDescription = "Photo Preview",
+                            contentScale = ContentScale.Fit,
+                            modifier = Modifier.fillMaxSize()
+                        )
+                    }
+
+                    if (isBrushActive) {
+                        val hint = when {
+                            state.eraserModeActive -> "Eraser On — Rub photo to erase"
+                            state.restoreBrushActive -> "Restore Brush — Rub to restore pixels"
+                            else -> "Spot Heal — Rub blemishes to blend"
+                        }
+                        Surface(
+                            color = brushBorderColor.copy(alpha = 0.92f),
+                            shape = RoundedCornerShape(16.dp),
+                            modifier = Modifier
+                                .align(Alignment.BottomCenter)
+                                .padding(8.dp)
+                        ) {
+                            Text(
+                                text = hint,
+                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                                color = Color.White,
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                            )
+                        }
+                    }
                 }
 
-                if (isBrushActive) {
-                    val hint = when {
-                        state.eraserModeActive -> "Eraser On — Rub photo to erase"
-                        state.restoreBrushActive -> "Restore Brush — Rub to restore pixels"
-                        else -> "Spot Heal — Rub blemishes to blend"
-                    }
-                    Surface(
-                        color = brushBorderColor.copy(alpha = 0.92f),
-                        shape = RoundedCornerShape(16.dp),
-                        modifier = Modifier
-                            .align(Alignment.BottomCenter)
-                            .padding(8.dp)
+                // Interactive White Touch Transform Box for Selected Layer (Text, Sticker, Shape, or Image)
+                val selLayer = state.selectedLayer?.takeIf { it.visible && !it.locked && !isBrushActive && editingTextLayerId == null }
+                if (selLayer != null) {
+                    val box = computePhotoLayerBoxPx(selLayer, canvasW, canvasH)
+                    val leftPx = (box.cx - box.boxW / 2f)
+                        .roundToInt()
+                        .coerceIn(-24, (canvasW - 40).coerceAtLeast(0))
+                    val topPx = (box.cy - box.boxH / 2f)
+                        .roundToInt()
+                        .coerceIn(-12, (canvasH - 40).coerceAtLeast(0))
+                    val isEditableText = selLayer.kind == LayerKind.TEXT || selLayer.kind == LayerKind.STICKER
+
+                    InteractiveWhiteTransformBox(
+                        leftPx = leftPx,
+                        topPx = topPx,
+                        boxW = box.boxW.roundToInt(),
+                        boxH = box.boxH.roundToInt(),
+                        rotationDeg = selLayer.rotationDeg,
+                        showDeleteX = false,
+                        onDeleteClick = {},
+                        onDragMoveDelta = { dxPx, dyPx ->
+                            viewModel.transformSelectedPhotoLayer(
+                                dxNorm = dxPx / canvasW.toFloat(),
+                                dyNorm = dyPx / canvasH.toFloat(),
+                                zoomFactor = 1f,
+                                rotationDeltaDeg = 0f
+                            )
+                        },
+                        onPinchRotate = { zoom, rotDeg ->
+                            viewModel.transformSelectedPhotoLayer(
+                                dxNorm = 0f,
+                                dyNorm = 0f,
+                                zoomFactor = zoom,
+                                rotationDeltaDeg = rotDeg
+                            )
+                        },
+                        onCornerScaleDelta = { deltaNorm ->
+                            viewModel.transformSelectedPhotoLayer(
+                                dxNorm = 0f,
+                                dyNorm = 0f,
+                                zoomFactor = (1f + deltaNorm * 1.15f).coerceIn(0.65f, 1.5f),
+                                rotationDeltaDeg = 0f
+                            )
+                        },
+                        onRotateDeltaDeg = { deltaDeg ->
+                            viewModel.transformSelectedPhotoLayer(
+                                dxNorm = 0f,
+                                dyNorm = 0f,
+                                zoomFactor = 1f,
+                                rotationDeltaDeg = deltaDeg
+                            )
+                        },
+                        onDoubleTapBox = if (isEditableText) {
+                            { openInlineTextEditor(selLayer) }
+                        } else null,
+                        badgeHint = if (isEditableText) "Double-tap to edit" else null,
+                        minCanvasEdge = minCanvasEdge,
+                        tagPrefix = "photo_layer_${selLayer.id}"
+                    )
+                }
+            }
+
+            // Double-Tap Inline Text Editor Overlay (Live canvas preview as you type)
+            val editingLayer = editingTextLayerId?.let { id -> state.layers.firstOrNull { it.id == id } }
+            if (editingLayer != null) {
+                val focusRequester = remember { FocusRequester() }
+                LaunchedEffect(editingLayer.id) {
+                    runCatching { focusRequester.requestFocus() }
+                }
+                Surface(
+                    color = DeepObsidian.copy(alpha = 0.96f),
+                    shape = RoundedCornerShape(16.dp),
+                    border = BorderStroke(1.2.dp, ElectricCyan),
+                    shadowElevation = 8.dp,
+                    modifier = Modifier
+                        .align(Alignment.Center)
+                        .fillMaxWidth(0.92f)
+                        .zIndex(20f)
+                        .testTag("photo_inline_text_editor")
+                ) {
+                    Column(
+                        modifier = Modifier.padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        Text(
-                            text = hint,
-                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
-                            color = Color.White,
-                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = if (editingLayer.kind == LayerKind.STICKER) "Edit Sticker Text" else "Edit Text Layer",
+                                style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold),
+                                color = ElectricCyan
+                            )
+                            IconButton(
+                                onClick = {
+                                    viewModel.updatePhotoLayerById(editingLayer.id) { l ->
+                                        if (l.kind == LayerKind.STICKER) l.copy(stickerSymbol = inlineOriginalText)
+                                        else l.copy(text = inlineOriginalText)
+                                    }
+                                    editingTextLayerId = null
+                                },
+                                modifier = Modifier.size(28.dp)
+                            ) {
+                                Icon(Icons.Default.Close, contentDescription = "Cancel Edit", tint = TextSecondary, modifier = Modifier.size(18.dp))
+                            }
+                        }
+
+                        OutlinedTextField(
+                            value = inlineDraftText,
+                            onValueChange = { updated ->
+                                inlineDraftText = updated
+                                viewModel.updatePhotoLayerById(editingLayer.id) { l ->
+                                    if (l.kind == LayerKind.STICKER) l.copy(stickerSymbol = updated)
+                                    else l.copy(text = updated)
+                                }
+                            },
+                            placeholder = { Text("Type your headline...") },
+                            maxLines = 3,
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedBorderColor = ElectricCyan,
+                                unfocusedBorderColor = StudioBorder,
+                                focusedTextColor = TextPrimary,
+                                unfocusedTextColor = TextPrimary
+                            ),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .focusRequester(focusRequester)
+                                .testTag("photo_inline_text_field")
                         )
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            OutlinedButton(
+                                onClick = {
+                                    viewModel.updatePhotoLayerById(editingLayer.id) { l ->
+                                        if (l.kind == LayerKind.STICKER) l.copy(stickerSymbol = inlineOriginalText)
+                                        else l.copy(text = inlineOriginalText)
+                                    }
+                                    editingTextLayerId = null
+                                },
+                                border = BorderStroke(1.dp, StudioBorder),
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text("Cancel", color = TextSecondary, fontSize = 12.sp)
+                            }
+                            Button(
+                                onClick = { editingTextLayerId = null },
+                                colors = ButtonDefaults.buttonColors(containerColor = ElectricCyan, contentColor = Color.White),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .testTag("photo_inline_text_done")
+                            ) {
+                                Icon(Icons.Default.Check, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(Modifier.width(4.dp))
+                                Text("Done", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                            }
+                        }
                     }
                 }
             }
@@ -710,6 +965,15 @@ fun PhotoStudioWorkspace(
 
                         PhotoToolTab.ADJUST -> {
                             val lr = state.lightroom
+                            StudioActionPill(
+                                label = "AI Magic Auto-Color",
+                                icon = Icons.Default.AutoAwesome,
+                                accent = ElectricCyan,
+                                onClick = { viewModel.autoColorEnhancePhoto() },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .testTag("photo_ai_magic_auto_color_button")
+                            )
                             // Tone Curves row
                             Row(
                                 modifier = Modifier
@@ -944,4 +1208,81 @@ fun PhotoStudioWorkspace(
             }
         }
     }
+}
+
+private data class PhotoLayerBoxPx(
+    val cx: Float,
+    val cy: Float,
+    val boxW: Float,
+    val boxH: Float
+)
+
+private fun computePhotoLayerBoxPx(
+    layer: PhotoLayer,
+    canvasW: Int,
+    canvasH: Int
+): PhotoLayerBoxPx {
+    val w = canvasW.coerceAtLeast(1).toFloat()
+    val h = canvasH.coerceAtLeast(1).toFloat()
+    val minEdge = min(w, h)
+    val cx = layer.xNorm * w
+    val cy = layer.yNorm * h
+
+    val (boxW, boxH) = when (layer.kind) {
+        LayerKind.TEXT -> {
+            val textSizePx = (minEdge * 0.12f * layer.scale).coerceIn(18f, w * 0.45f)
+            val lines = layer.text.ifBlank { "BLACK DEVIL" }.split("\n")
+            val maxChars = (lines.maxOfOrNull { it.length } ?: 6).coerceAtLeast(3)
+            val bw = (maxChars * textSizePx * 0.62f + 26f).coerceIn((w * 0.24f).coerceAtLeast(88f), w * 0.92f)
+            val bh = (lines.size * textSizePx * 1.25f + 22f).coerceIn((h * 0.14f).coerceAtLeast(52f), h * 0.72f)
+            bw to bh
+        }
+        LayerKind.STICKER -> {
+            val bw = (minEdge * 0.30f * layer.scale).coerceIn(78f, w * 0.85f)
+            val bh = (bw * 0.46f).coerceIn(46f, h * 0.55f)
+            bw to bh
+        }
+        LayerKind.SHAPE -> {
+            val baseSize = minEdge * 0.24f * layer.scale
+            val bw = (baseSize * 1.48f).coerceIn(74f, w * 0.85f)
+            val bh = (baseSize * 1.28f).coerceIn(66f, h * 0.85f)
+            bw to bh
+        }
+        LayerKind.IMAGE -> {
+            if (layer.isBackground) {
+                val sc = layer.scale.coerceIn(0.45f, 1.0f)
+                (w * 0.84f * sc).coerceIn(96f, w * 0.90f) to (h * 0.84f * sc).coerceIn(80f, h * 0.90f)
+            } else {
+                val baseFit = minEdge * 0.66f * layer.scale
+                baseFit.coerceIn(84f, w * 0.90f) to baseFit.coerceIn(84f, h * 0.90f)
+            }
+        }
+    }
+    return PhotoLayerBoxPx(cx = cx, cy = cy, boxW = boxW, boxH = boxH)
+}
+
+private fun hitTestPhotoLayer(
+    layers: List<PhotoLayer>,
+    tapX: Float,
+    tapY: Float,
+    canvasW: Int,
+    canvasH: Int
+): PhotoLayer? {
+    // Check topmost foreground layers first so text/stickers/cutouts are effortless to tap
+    val foregroundCandidates = layers.asReversed().filter { it.visible && !it.locked && !it.isBackground }
+    for (layer in foregroundCandidates) {
+        val box = computePhotoLayerBoxPx(layer, canvasW, canvasH)
+        val dx = tapX - box.cx
+        val dy = tapY - box.cy
+        val rad = (-layer.rotationDeg) * PI.toFloat() / 180f
+        val cosA = cos(rad)
+        val sinA = sin(rad)
+        val localX = dx * cosA - dy * sinA
+        val localY = dx * sinA + dy * cosA
+        val pad = 16f
+        if (abs(localX) <= box.boxW / 2f + pad && abs(localY) <= box.boxH / 2f + pad) {
+            return layer
+        }
+    }
+    return null
 }

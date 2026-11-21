@@ -204,6 +204,43 @@ enum class VideoExportFps(val label: String, val fps: Int) {
     FPS_60("Smooth", 60)
 }
 
+enum class VideoExportPreset(
+    val label: String,
+    val subtitle: String,
+    val aspect: VideoAspectPreset?,
+    val resolution: VideoExportResolution,
+    val fps: VideoExportFps
+) {
+    YOUTUBE_4K_60(
+        label = "YouTube 4K 60fps",
+        subtitle = "16:9 • 4K Ultra • 60fps",
+        aspect = VideoAspectPreset.YOUTUBE_16_9,
+        resolution = VideoExportResolution.UHD_4K,
+        fps = VideoExportFps.FPS_60
+    ),
+    REELS_SHORTS_1080_60(
+        label = "Reels/Shorts 1080p 60fps",
+        subtitle = "9:16 • Full HD • 60fps",
+        aspect = VideoAspectPreset.SHORTS_9_16,
+        resolution = VideoExportResolution.FHD_1080P,
+        fps = VideoExportFps.FPS_60
+    ),
+    INSTAGRAM_1080(
+        label = "Instagram 1080p",
+        subtitle = "4:5 • Full HD • 30fps",
+        aspect = VideoAspectPreset.PORTRAIT_4_5,
+        resolution = VideoExportResolution.FHD_1080P,
+        fps = VideoExportFps.FPS_30
+    ),
+    WHATSAPP_FAST(
+        label = "WhatsApp Fast Share",
+        subtitle = "HD 720p • Fast Compact • 30fps",
+        aspect = null,
+        resolution = VideoExportResolution.HD_720P,
+        fps = VideoExportFps.FPS_30
+    )
+}
+
 data class HardwareEncoderCapabilities(
     val encoderName: String = "Hardware AVC",
     val supports4K30: Boolean = false,
@@ -258,7 +295,9 @@ data class VideoClip(
     val motionBlur: Float = 0f, // 0..1
     val transitionAfter: VideoTransition = VideoTransition.CROSSFADE,
     val transitionDurationMs: Long = 500L,
-    val keyframes: List<VideoKeyframe> = emptyList()
+    val keyframes: List<VideoKeyframe> = emptyList(),
+    val sourceWidth: Int = 0,
+    val sourceHeight: Int = 0
 ) {
     val effectiveDurationMs: Long
         get() = (((trimEndMs - trimStartMs).coerceAtLeast(300L)) / speed.coerceIn(0.1f, 10f)).toLong().coerceAtLeast(250L)

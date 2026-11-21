@@ -119,8 +119,12 @@ object VideoMediaEngine {
         return try {
             retriever.setDataSource(context, Uri.parse(uriString))
             val dur = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 5000L
-            val w = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 1280
-            val h = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 720
+            val rawW = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 1280
+            val rawH = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 720
+            val rot = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
+            val swapped = rot == 90 || rot == 270
+            val w = if (swapped) rawH else rawW
+            val h = if (swapped) rawW else rawH
             VideoMetadataInfo(dur.coerceAtLeast(500L), w, h)
         } catch (_: Exception) {
             VideoMetadataInfo(5000L, 1280, 720)
@@ -233,10 +237,12 @@ object VideoMediaEngine {
         localClipMs: Long,
         maxEdge: Int
     ): Bitmap {
+        val safeStart = clip.trimStartMs.coerceAtLeast(0L)
+        val safeEnd = clip.trimEndMs.coerceAtLeast(safeStart)
         val clampedMs = if (clip.reversed) {
-            (clip.trimEndMs - localClipMs).coerceIn(clip.trimStartMs, clip.trimEndMs)
+            (safeEnd - localClipMs).coerceIn(safeStart, safeEnd)
         } else {
-            (clip.trimStartMs + localClipMs).coerceIn(clip.trimStartMs, clip.trimEndMs)
+            (safeStart + localClipMs).coerceIn(safeStart, safeEnd)
         }
 
         if (!clip.uriString.isNullOrBlank()) {

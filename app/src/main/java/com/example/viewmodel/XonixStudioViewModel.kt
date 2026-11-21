@@ -54,6 +54,7 @@ import com.example.model.VideoClip
 import com.example.model.VideoColorGrade
 import com.example.model.VideoEditorState
 import com.example.model.VideoExportFps
+import com.example.model.VideoExportPreset
 import com.example.model.VideoExportResolution
 import com.example.model.VideoKeyframe
 import com.example.model.VideoTextOverlay
@@ -191,8 +192,15 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
     private val _encoderCapabilities = MutableStateFlow(HardwareEncoderCapabilities())
     val encoderCapabilities: StateFlow<HardwareEncoderCapabilities> = _encoderCapabilities.asStateFlow()
 
+    private val _openVideoExportRequested = MutableStateFlow(false)
+    val openVideoExportRequested: StateFlow<Boolean> = _openVideoExportRequested.asStateFlow()
+
     private var videoRenderJob: Job? = null
     private var photoRenderJob: Job? = null
+    private val videoRenderDirty = AtomicBoolean(false)
+    private val videoRenderImmediate = AtomicBoolean(false)
+    private val photoRenderDirty = AtomicBoolean(false)
+    private val photoRenderImmediate = AtomicBoolean(false)
     private var playbackJob: Job? = null
     private var audioPlayJob: Job? = null
     private var micRecordJob: Job? = null
@@ -362,11 +370,19 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
             stopAudioMixPlayback()
             _activeWorkspace.value = workspace
             when (workspace) {
-                StudioWorkspace.VIDEO -> scheduleVideoPreviewRender()
-                StudioWorkspace.PHOTO -> schedulePhotoPreviewRender()
+                StudioWorkspace.VIDEO -> if (_videoPreviewBitmap.value == null) scheduleVideoPreviewRender(true)
+                StudioWorkspace.PHOTO -> if (_photoPreviewBitmap.value == null) schedulePhotoPreviewRender(true)
                 else -> Unit
             }
         }
+    }
+
+    fun requestOpenVideoExport() {
+        _openVideoExportRequested.value = true
+    }
+
+    fun consumeVideoExportRequest() {
+        _openVideoExportRequested.value = false
     }
 
     fun showToast(msg: String) {
@@ -446,14 +462,20 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
     }
 
     private fun scheduleVideoPreviewRender(immediate: Boolean = false) {
-        videoRenderJob?.cancel()
+        if (immediate) videoRenderImmediate.set(true)
+        videoRenderDirty.set(true)
+        if (videoRenderJob?.isActive == true) return
         videoRenderJob = viewModelScope.launch {
-            if (!immediate) delay(35L)
-            val snapshot = _videoState.value
-            val rendered = withContext(Dispatchers.Default) {
-                VideoMediaEngine.renderPreviewAtPlayhead(appContext, snapshot, maxEdge = 720)
+            while (videoRenderDirty.getAndSet(false)) {
+                val isFastImmediate = videoRenderImmediate.getAndSet(false)
+                if (!isFastImmediate) delay(18L)
+                val snapshot = _videoState.value
+                val targetEdge = if (snapshot.isPlaying || !isFastImmediate) 600 else 720
+                val rendered = withContext(Dispatchers.Default) {
+                    VideoMediaEngine.renderPreviewAtPlayhead(appContext, snapshot, maxEdge = targetEdge)
+                }
+                _videoPreviewBitmap.value = rendered
             }
-            _videoPreviewBitmap.value = rendered
         }
     }
 
@@ -488,7 +510,9 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
                         trimStartMs = 0L,
                         trimEndMs = meta.durationMs,
                         speed = 1f,
-                        transitionAfter = VideoTransition.CROSSFADE
+                        transitionAfter = VideoTransition.CROSSFADE,
+                        sourceWidth = meta.width,
+                        sourceHeight = meta.height
                     )
                 }
             }
@@ -604,7 +628,9 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
                                 fallbackDrawable = null,
                                 durationMs = meta.durationMs,
                                 trimStartMs = 0L,
-                                trimEndMs = meta.durationMs
+                                trimEndMs = meta.durationMs,
+                                sourceWidth = meta.width,
+                                sourceHeight = meta.height
                             )
                         } else c
                     }
@@ -619,7 +645,11 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
     }
 
     fun selectClip(id: String) {
-        _videoState.update { it.copy(selectedClipId = id) }
+        _videoState.update { it.copy(selectedClipId = id, selectedAudioClipId = null) }
+    }
+
+    fun clearTimelineSelection() {
+        _videoState.update { it.copy(selectedClipId = null, selectedAudioClipId = null) }
     }
 
     fun reorderClip(id: String, moveLeft: Boolean) {
@@ -638,25 +668,51 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
         scheduleAutoSave(WorkspaceType.VIDEO)
     }
 
+    private fun findClipAtPlayhead(s: VideoEditorState): Triple<Int, VideoClip, Long>? {
+        if (s.clips.isEmpty()) return null
+        var acc = 0L
+        s.clips.forEachIndexed { idx, clip ->
+            val dur = clip.effectiveDurationMs
+            if (s.playheadMs <= acc + dur || idx == s.clips.lastIndex) {
+                val localMs = (s.playheadMs - acc).coerceIn(0L, dur)
+                return Triple(idx, clip, localMs)
+            }
+            acc += dur
+        }
+        return null
+    }
+
     fun splitSelectedClipAtPlayhead() {
+        val snapshot = _videoState.value
+        val hit = findClipAtPlayhead(snapshot) ?: return
+        val (idx, target, localTimeline) = hit
+        val safeStart = target.trimStartMs.coerceAtLeast(0L)
+        val safeEnd = target.trimEndMs.coerceAtLeast(safeStart)
+        val minSplitSrcMs = safeStart + 250L
+        val maxSplitSrcMs = safeEnd - 250L
+        if (maxSplitSrcMs < minSplitSrcMs) {
+            showToast("Clip is too short to split")
+            return
+        }
+        val rawSplitSrcMs = safeStart + (localTimeline * target.speed).toLong()
+        if (rawSplitSrcMs < safeStart + 200L || rawSplitSrcMs > safeEnd - 200L) {
+            showToast("Move playhead inside the clip to split")
+            return
+        }
+        val splitSrcMs = rawSplitSrcMs.coerceIn(minSplitSrcMs, maxSplitSrcMs)
         recordVideoUndoSnapshot()
         _videoState.update { s ->
-            val target = s.selectedClip ?: return@update s
-            val idx = s.clips.indexOfFirst { it.id == target.id }
-            if (idx < 0) return@update s
-            var offset = 0L
-            for (i in 0 until idx) offset += s.clips[i].effectiveDurationMs
-            val localTimeline = (s.playheadMs - offset).coerceIn(300L, target.effectiveDurationMs - 300L)
-            val splitSrcMs = (target.trimStartMs + (localTimeline * target.speed).toLong())
-                .coerceIn(target.trimStartMs + 250L, target.trimEndMs - 250L)
-            if (splitSrcMs <= target.trimStartMs + 200L || splitSrcMs >= target.trimEndMs - 200L) {
-                return@update s
-            }
-            val partA = target.copy(trimEndMs = splitSrcMs)
-            val partB = target.copy(
+            val currentTarget = s.clips.getOrNull(idx) ?: return@update s
+            val partAKfs = currentTarget.keyframes.filter { it.timeMs <= localTimeline }
+            val partBKfs = currentTarget.keyframes
+                .filter { it.timeMs > localTimeline }
+                .map { it.copy(timeMs = (it.timeMs - localTimeline).coerceAtLeast(0L)) }
+            val partA = currentTarget.copy(trimEndMs = splitSrcMs, keyframes = partAKfs)
+            val partB = currentTarget.copy(
                 id = "clip_${UUID.randomUUID().toString().take(8)}",
-                name = "${target.name} (B)",
-                trimStartMs = splitSrcMs
+                name = "${currentTarget.name} (B)",
+                trimStartMs = splitSrcMs,
+                keyframes = partBKfs
             )
             val mutable = s.clips.toMutableList()
             mutable[idx] = partA
@@ -665,7 +721,78 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
         }
         refreshFilmstripThumbnails(_videoState.value.clips)
         showToast("Clip split at playhead")
-        scheduleVideoPreviewRender()
+        scheduleVideoPreviewRender(true)
+        scheduleAutoSave(WorkspaceType.VIDEO)
+    }
+
+    fun trimClipLeftToPlayhead() {
+        val snapshot = _videoState.value
+        val hit = findClipAtPlayhead(snapshot) ?: return
+        val (idx, target, localTimeline) = hit
+        if (localTimeline < 80L) {
+            showToast("Playhead is already at clip start")
+            return
+        }
+        val newStart = (target.trimStartMs + (localTimeline * target.speed).toLong())
+            .coerceIn(target.trimStartMs, (target.trimEndMs - 300L).coerceAtLeast(target.trimStartMs))
+        if (newStart <= target.trimStartMs) {
+            showToast("Clip is already at minimum length")
+            return
+        }
+        recordVideoUndoSnapshot()
+        var clipOffset = 0L
+        for (i in 0 until idx) clipOffset += snapshot.clips[i].effectiveDurationMs
+        _videoState.update { s ->
+            val updatedClips = s.clips.mapIndexed { i, c ->
+                if (i == idx) {
+                    val shiftedKfs = c.keyframes.mapNotNull { kf ->
+                        val nextT = kf.timeMs - localTimeline
+                        if (nextT >= 0L) kf.copy(timeMs = nextT) else null
+                    }
+                    c.copy(trimStartMs = newStart, keyframes = shiftedKfs)
+                } else c
+            }
+            s.copy(
+                clips = updatedClips,
+                selectedClipId = target.id,
+                playheadMs = clipOffset
+            )
+        }
+        showToast("Trimmed left to playhead")
+        scheduleVideoPreviewRender(true)
+        scheduleAutoSave(WorkspaceType.VIDEO)
+    }
+
+    fun trimClipRightToPlayhead() {
+        val snapshot = _videoState.value
+        val hit = findClipAtPlayhead(snapshot) ?: return
+        val (idx, target, localTimeline) = hit
+        if (localTimeline >= target.effectiveDurationMs - 80L) {
+            showToast("Playhead is already at clip end")
+            return
+        }
+        val newEnd = (target.trimStartMs + (localTimeline * target.speed).toLong())
+            .coerceIn((target.trimStartMs + 300L).coerceAtMost(target.trimEndMs), target.trimEndMs)
+        if (newEnd >= target.trimEndMs) {
+            showToast("Clip is already at minimum length")
+            return
+        }
+        recordVideoUndoSnapshot()
+        _videoState.update { s ->
+            val updatedClips = s.clips.mapIndexed { i, c ->
+                if (i == idx) {
+                    val clampedKfs = c.keyframes.filter { it.timeMs <= localTimeline }
+                    c.copy(trimEndMs = newEnd, keyframes = clampedKfs)
+                } else c
+            }
+            s.copy(
+                clips = updatedClips,
+                selectedClipId = target.id,
+                playheadMs = s.playheadMs.coerceAtMost(updatedClips.sumOf { it.effectiveDurationMs })
+            )
+        }
+        showToast("Trimmed right to playhead")
+        scheduleVideoPreviewRender(true)
         scheduleAutoSave(WorkspaceType.VIDEO)
     }
 
@@ -909,13 +1036,44 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
     }
 
     fun selectVideoAudioClip(id: String) {
-        _videoState.update { it.copy(selectedAudioClipId = id) }
+        _videoState.update { it.copy(selectedAudioClipId = id, selectedClipId = null) }
     }
 
     fun updateSelectedVideoAudioClip(transform: (VideoAudioClip) -> VideoAudioClip) {
         _videoState.update { s ->
             val id = s.selectedAudioClip?.id ?: return@update s
             s.copy(audioLaneClips = s.audioLaneClips.map { if (it.id == id) transform(it) else it })
+        }
+        scheduleAutoSave(WorkspaceType.VIDEO)
+    }
+
+    fun trimVideoAudioClip(
+        id: String,
+        trimStartPct: Float? = null,
+        trimEndPct: Float? = null,
+        startMs: Long? = null
+    ) {
+        recordVideoUndoSnapshot(coalesceTag = "audio_trim_$id")
+        _videoState.update { s ->
+            val maxStart = s.totalDurationMs.coerceAtLeast(0L)
+            s.copy(
+                selectedAudioClipId = id,
+                selectedClipId = null,
+                audioLaneClips = s.audioLaneClips.map { a ->
+                    if (a.id != id) a else {
+                        val nextStartPct = (trimStartPct ?: a.trimStartPct)
+                            .coerceIn(0f, (a.trimEndPct - 0.06f).coerceAtLeast(0f))
+                        val nextEndPct = (trimEndPct ?: a.trimEndPct)
+                            .coerceIn((nextStartPct + 0.06f).coerceAtMost(1f), 1f)
+                        val nextStartMs = (startMs ?: a.startMs).coerceIn(0L, maxStart)
+                        a.copy(
+                            trimStartPct = nextStartPct,
+                            trimEndPct = nextEndPct,
+                            startMs = nextStartMs
+                        )
+                    }
+                }
+            )
         }
         scheduleAutoSave(WorkspaceType.VIDEO)
     }
@@ -942,7 +1100,23 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
         scheduleAutoSave(WorkspaceType.VIDEO)
     }
 
+    fun moveVideoAudioClip(id: String, newStartMs: Long) {
+        recordVideoUndoSnapshot(coalesceTag = "audio_drag_$id")
+        _videoState.update { s ->
+            val maxStart = s.totalDurationMs.coerceAtLeast(0L)
+            s.copy(
+                selectedAudioClipId = id,
+                selectedClipId = null,
+                audioLaneClips = s.audioLaneClips.map { a ->
+                    if (a.id == id) a.copy(startMs = newStartMs.coerceIn(0L, maxStart)) else a
+                }
+            )
+        }
+        scheduleAutoSave(WorkspaceType.VIDEO)
+    }
+
     fun deleteSelectedVideoAudioClip() {
+        recordVideoUndoSnapshot()
         _videoState.update { s ->
             val id = s.selectedAudioClip?.id ?: return@update s
             val rem = s.audioLaneClips.filterNot { it.id == id }
@@ -976,6 +1150,10 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
 
     fun getSelectedClipLocalTimeMs(): Long {
         val s = _videoState.value
+        val hit = findClipAtPlayhead(s)
+        if (hit != null && hit.second.id == s.selectedClip?.id) {
+            return hit.third
+        }
         val target = s.selectedClip ?: return 0L
         var offset = 0L
         for (c in s.clips) {
@@ -994,37 +1172,50 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
         rotationDeg: Float? = null,
         opacity: Float? = null
     ) {
-        val localMs = getSelectedClipLocalTimeMs()
-        updateSelectedClip { clip ->
-            val currentInterp = VideoMediaEngine.interpolateKeyframes(clip.keyframes, localMs)
-            val existingIdx = clip.keyframes.indexOfFirst { kotlin.math.abs(it.timeMs - localMs) <= 180L }
-            val updatedKf = if (existingIdx >= 0) {
-                val ex = clip.keyframes[existingIdx]
-                ex.copy(
-                    xNorm = xNorm ?: ex.xNorm,
-                    yNorm = yNorm ?: ex.yNorm,
-                    scale = scale ?: ex.scale,
-                    rotationDeg = rotationDeg ?: ex.rotationDeg,
-                    opacity = opacity ?: ex.opacity
-                )
-            } else {
-                VideoKeyframe(
-                    id = "kf_${UUID.randomUUID().toString().take(6)}",
-                    timeMs = localMs,
-                    xNorm = xNorm ?: currentInterp.xNorm,
-                    yNorm = yNorm ?: currentInterp.yNorm,
-                    scale = scale ?: currentInterp.scale,
-                    rotationDeg = rotationDeg ?: currentInterp.rotationDeg,
-                    opacity = opacity ?: currentInterp.opacity
-                )
+        val snapshot = _videoState.value
+        val hit = findClipAtPlayhead(snapshot) ?: return
+        val (_, targetClip, exactLocalMs) = hit
+        val isSliderUpdate = xNorm != null || yNorm != null || scale != null || rotationDeg != null || opacity != null
+        recordVideoUndoSnapshot(coalesceTag = if (isSliderUpdate) "kf_slider" else null)
+
+        _videoState.update { s ->
+            val nextClips = s.clips.map { clip ->
+                if (clip.id != targetClip.id) return@map clip
+                val currentInterp = VideoMediaEngine.interpolateKeyframes(clip.keyframes, exactLocalMs)
+                // Tight 45ms tolerance so user can add multiple distinct keyframes anywhere along the clip
+                val existingIdx = clip.keyframes.indexOfFirst { kotlin.math.abs(it.timeMs - exactLocalMs) <= 45L }
+                val updatedKf = if (existingIdx >= 0) {
+                    val ex = clip.keyframes[existingIdx]
+                    ex.copy(
+                        timeMs = exactLocalMs,
+                        xNorm = xNorm ?: ex.xNorm,
+                        yNorm = yNorm ?: ex.yNorm,
+                        scale = scale ?: ex.scale,
+                        rotationDeg = rotationDeg ?: ex.rotationDeg,
+                        opacity = opacity ?: ex.opacity
+                    )
+                } else {
+                    VideoKeyframe(
+                        id = "kf_${UUID.randomUUID().toString().take(6)}",
+                        timeMs = exactLocalMs,
+                        xNorm = xNorm ?: currentInterp.xNorm,
+                        yNorm = yNorm ?: currentInterp.yNorm,
+                        scale = scale ?: currentInterp.scale,
+                        rotationDeg = rotationDeg ?: currentInterp.rotationDeg,
+                        opacity = opacity ?: currentInterp.opacity
+                    )
+                }
+                val nextList = if (existingIdx >= 0) {
+                    clip.keyframes.mapIndexed { i, k -> if (i == existingIdx) updatedKf else k }
+                } else {
+                    (clip.keyframes + updatedKf).sortedBy { it.timeMs }
+                }
+                clip.copy(keyframes = nextList)
             }
-            val nextList = if (existingIdx >= 0) {
-                clip.keyframes.mapIndexed { i, k -> if (i == existingIdx) updatedKf else k }
-            } else {
-                (clip.keyframes + updatedKf).sortedBy { it.timeMs }
-            }
-            clip.copy(keyframes = nextList)
+            s.copy(clips = nextClips, selectedClipId = targetClip.id)
         }
+        scheduleVideoPreviewRender(true)
+        scheduleAutoSave(WorkspaceType.VIDEO)
     }
 
     fun deleteKeyframe(id: String) {
@@ -1150,14 +1341,14 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
     ) {
         recordVideoUndoSnapshot(coalesceTag = "canvas_transform")
         _videoState.update { s ->
-            val selId = s.selectedClip?.id
+            val selId = findClipAtPlayhead(s)?.second?.id ?: s.selectedClip?.id
             val nextClips = if (rotationDeg != null && selId != null) {
                 s.clips.map { c -> if (c.id == selId) c.copy(rotationDeg = rotationDeg) else c }
             } else {
                 s.clips
             }
             s.copy(
-                cropZoom = (zoom ?: s.cropZoom).coerceIn(0.4f, 3.0f),
+                cropZoom = (zoom ?: s.cropZoom).coerceIn(0.25f, 3.0f),
                 panX = (panX ?: s.panX).coerceIn(-1f, 1f),
                 panY = (panY ?: s.panY).coerceIn(-1f, 1f),
                 clips = nextClips
@@ -1297,6 +1488,54 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
         showToast(if (enabled) "Enhance ON — sharper, clearer video" else "Enhance OFF")
     }
 
+    /**
+     * AI Magic Auto-Color Enhance: analyzes the current preview frame's pixel luminance,
+     * dynamic range, and chroma saturation on-device and applies optimal color balance + clarity.
+     */
+    fun autoColorEnhanceVideo() {
+        recordVideoUndoSnapshot()
+        viewModelScope.launch {
+            val stats = withContext(Dispatchers.Default) {
+                analyzeBitmapColorStats(_videoPreviewBitmap.value)
+            }
+            _videoState.update { s ->
+                s.copy(
+                    colorGrade = s.colorGrade.copy(
+                        brightness = stats.brightnessBoost,
+                        contrast = stats.contrastBoost,
+                        saturation = stats.saturationBoost,
+                        exposure = stats.exposureBoost,
+                        temperature = stats.warmthBoost,
+                        sharpen = stats.sharpenBoost,
+                        qualityEnhancerEnabled = true
+                    )
+                )
+            }
+            scheduleVideoPreviewRender(true)
+            scheduleAutoSave(WorkspaceType.VIDEO)
+            showToast("AI Magic Color Enhance applied")
+        }
+    }
+
+    fun applyExportPreset(preset: VideoExportPreset, startExportImmediately: Boolean = false) {
+        recordVideoUndoSnapshot()
+        _videoState.update { s ->
+            s.copy(
+                aspectPreset = preset.aspect ?: s.aspectPreset,
+                exportResolution = preset.resolution,
+                exportFps = preset.fps
+            )
+        }
+        scheduleVideoPreviewRender(true)
+        scheduleAutoSave(WorkspaceType.VIDEO)
+        if (startExportImmediately) {
+            showToast("Exporting ${preset.label}...")
+            exportVideo()
+        } else {
+            showToast("Preset applied: ${preset.label}")
+        }
+    }
+
     fun exportVideo() {
         stopVideoPlayback()
         viewModelScope.launch {
@@ -1311,6 +1550,75 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
             _exportProgress.value = null
             handleExportFeedback("Video", result)
         }
+    }
+
+    private data class AutoColorStats(
+        val brightnessBoost: Float,
+        val contrastBoost: Float,
+        val saturationBoost: Float,
+        val exposureBoost: Float,
+        val warmthBoost: Float,
+        val sharpenBoost: Float
+    )
+
+    private fun analyzeBitmapColorStats(bmp: Bitmap?): AutoColorStats {
+        if (bmp == null || bmp.isRecycled || bmp.width < 4 || bmp.height < 4) {
+            return AutoColorStats(
+                brightnessBoost = 0.05f,
+                contrastBoost = 1.16f,
+                saturationBoost = 1.20f,
+                exposureBoost = 0.06f,
+                warmthBoost = 0.06f,
+                sharpenBoost = 0.35f
+            )
+        }
+        val stepX = (bmp.width / 24).coerceAtLeast(1)
+        val stepY = (bmp.height / 24).coerceAtLeast(1)
+        var count = 0
+        var lumaSum = 0f
+        var lumaSqSum = 0f
+        var satSum = 0f
+        var warmDiffSum = 0f
+        var y = 0
+        while (y < bmp.height) {
+            var x = 0
+            while (x < bmp.width) {
+                val px = bmp.getPixel(x, y)
+                val r = ((px ushr 16) and 0xFF) / 255f
+                val g = ((px ushr 8) and 0xFF) / 255f
+                val b = (px and 0xFF) / 255f
+                val luma = 0.299f * r + 0.587f * g + 0.114f * b
+                val maxC = maxOf(r, g, b)
+                val minC = minOf(r, g, b)
+                val sat = if (maxC > 0.001f) (maxC - minC) / maxC else 0f
+                lumaSum += luma
+                lumaSqSum += luma * luma
+                satSum += sat
+                warmDiffSum += (r - b)
+                count++
+                x += stepX
+            }
+            y += stepY
+        }
+        val n = count.coerceAtLeast(1).toFloat()
+        val meanLuma = lumaSum / n
+        val stdLuma = kotlin.math.sqrt((lumaSqSum / n - meanLuma * meanLuma).coerceAtLeast(0f))
+        val meanSat = satSum / n
+        val meanWarm = warmDiffSum / n
+
+        val brightness = ((0.50f - meanLuma) * 0.32f).coerceIn(-0.14f, 0.20f)
+        val exposure = ((0.48f - meanLuma) * 0.24f).coerceIn(-0.10f, 0.18f)
+        val contrast = (1.12f + (0.22f - stdLuma).coerceAtLeast(0f) * 0.65f).coerceIn(1.06f, 1.32f)
+        val saturation = (1.14f + (0.42f - meanSat).coerceAtLeast(0f) * 0.55f).coerceIn(1.08f, 1.38f)
+        val warmth = (-meanWarm * 0.28f + 0.05f).coerceIn(-0.12f, 0.16f)
+        return AutoColorStats(
+            brightnessBoost = brightness,
+            contrastBoost = contrast,
+            saturationBoost = saturation,
+            exposureBoost = exposure,
+            warmthBoost = warmth,
+            sharpenBoost = 0.36f
+        )
     }
 
     // =========================================================================
@@ -1393,18 +1701,48 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
         )
     }
 
+    fun autoColorEnhancePhoto() {
+        viewModelScope.launch {
+            val stats = withContext(Dispatchers.Default) {
+                analyzeBitmapColorStats(_photoPreviewBitmap.value)
+            }
+            _photoState.update { s ->
+                s.copy(
+                    lightroom = s.lightroom.copy(
+                        brightness = stats.brightnessBoost,
+                        contrast = stats.contrastBoost,
+                        saturation = stats.saturationBoost,
+                        vibrance = 0.22f,
+                        warmth = stats.warmthBoost,
+                        clarity = 0.26f,
+                        sharpness = stats.sharpenBoost
+                    )
+                )
+            }
+            schedulePhotoPreviewRender(true)
+            scheduleAutoSave(WorkspaceType.PHOTO)
+            showToast("AI Magic Auto-Color applied to photo")
+        }
+    }
+
     private fun schedulePhotoPreviewRender(immediate: Boolean = false) {
-        photoRenderJob?.cancel()
+        if (immediate) photoRenderImmediate.set(true)
+        photoRenderDirty.set(true)
+        if (photoRenderJob?.isActive == true) return
         photoRenderJob = viewModelScope.launch {
-            if (!immediate) delay(32L)
-            val snapshot = _photoState.value
-            val bmp = ImageProcessingEngine.renderPhotoComposition(
-                context = appContext,
-                state = snapshot,
-                maxEdge = 860,
-                includePreviewGuides = true
-            )
-            _photoPreviewBitmap.value = bmp
+            while (photoRenderDirty.getAndSet(false)) {
+                val isFastImmediate = photoRenderImmediate.getAndSet(false)
+                if (!isFastImmediate) delay(18L)
+                val snapshot = _photoState.value
+                val targetEdge = if (isFastImmediate) 840 else 680
+                val bmp = ImageProcessingEngine.renderPhotoComposition(
+                    context = appContext,
+                    state = snapshot,
+                    maxEdge = targetEdge,
+                    includePreviewGuides = true
+                )
+                _photoPreviewBitmap.value = bmp
+            }
         }
     }
 
@@ -1556,6 +1894,18 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
         scheduleAutoSave(WorkspaceType.PHOTO)
     }
 
+    fun clearPhotoLayerSelection() {
+        _photoState.update { it.copy(selectedLayerId = null) }
+    }
+
+    fun updatePhotoLayerById(id: String, transform: (PhotoLayer) -> PhotoLayer) {
+        _photoState.update { s ->
+            s.copy(layers = s.layers.map { if (it.id == id && !it.locked) transform(it) else it })
+        }
+        schedulePhotoPreviewRender()
+        scheduleAutoSave(WorkspaceType.PHOTO)
+    }
+
     fun updateSelectedPhotoLayer(transform: (PhotoLayer) -> PhotoLayer) {
         _photoState.update { s ->
             val id = s.selectedLayerId ?: return@update s
@@ -1616,11 +1966,14 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
             val id = s.selectedLayerId ?: return@update s
             s.copy(layers = s.layers.map { l ->
                 if (l.id == id && !l.locked) {
+                    var nextRot = (l.rotationDeg + rotationDeltaDeg) % 360f
+                    if (nextRot > 180f) nextRot -= 360f
+                    if (nextRot < -180f) nextRot += 360f
                     l.copy(
                         xNorm = (l.xNorm + dxNorm).coerceIn(0.02f, 0.98f),
                         yNorm = (l.yNorm + dyNorm).coerceIn(0.02f, 0.98f),
-                        scale = (l.scale * zoomFactor).coerceIn(0.25f, 2.8f),
-                        rotationDeg = (l.rotationDeg + rotationDeltaDeg).coerceIn(-180f, 180f)
+                        scale = (l.scale * zoomFactor).coerceIn(0.25f, 3.0f),
+                        rotationDeg = nextRot
                     )
                 } else l
             })

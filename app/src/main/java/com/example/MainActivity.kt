@@ -101,27 +101,12 @@ private fun XonixStudioApp(
     val authReady by viewModel.authReady.collectAsStateWithLifecycle()
     val currentUser by viewModel.currentUser.collectAsStateWithLifecycle()
     val authError by viewModel.authError.collectAsStateWithLifecycle()
-    val allUsers by viewModel.allUsers.collectAsStateWithLifecycle()
-    val allLoginHistory by viewModel.allLoginHistory.collectAsStateWithLifecycle()
-    val userLoginHistory by viewModel.currentUserLoginHistory.collectAsStateWithLifecycle()
     val isAdminUnlocked by viewModel.isAdminUnlocked.collectAsStateWithLifecycle()
-    val adminPinMessage by viewModel.adminPinMessage.collectAsStateWithLifecycle()
-    val adminLockoutMs by viewModel.adminLockoutMs.collectAsStateWithLifecycle()
 
     val activeWorkspace by viewModel.activeWorkspace.collectAsStateWithLifecycle()
-    val openEnhanceRequested by viewModel.openVideoEnhanceRequested.collectAsStateWithLifecycle()
-    val videoState by viewModel.videoState.collectAsStateWithLifecycle()
-    val videoPreview by viewModel.videoPreviewBitmap.collectAsStateWithLifecycle()
-    val clipThumbnails by viewModel.clipThumbnails.collectAsStateWithLifecycle()
-    val photoState by viewModel.photoState.collectAsStateWithLifecycle()
-    val photoPreview by viewModel.photoPreviewBitmap.collectAsStateWithLifecycle()
-    val audioState by viewModel.audioState.collectAsStateWithLifecycle()
-    val utilitiesState by viewModel.utilitiesState.collectAsStateWithLifecycle()
-    val vaultProjects by viewModel.vaultProjects.collectAsStateWithLifecycle()
     val exportProgress by viewModel.exportProgress.collectAsStateWithLifecycle()
     val toastMessage by viewModel.toastMessage.collectAsStateWithLifecycle()
     val autoSaveLabel by viewModel.autoSaveLabel.collectAsStateWithLifecycle()
-    val encoderCapabilities by viewModel.encoderCapabilities.collectAsStateWithLifecycle()
 
     val snackbarHostState = remember { SnackbarHostState() }
     var showProfileSheet by remember { mutableStateOf(false) }
@@ -191,7 +176,11 @@ private fun XonixStudioApp(
                             true
                         }
                         event.isCtrlPressed && event.key == Key.E -> {
-                            viewModel.triggerWorkspaceExport()
+                            if (activeWorkspace == StudioWorkspace.VIDEO) {
+                                viewModel.requestOpenVideoExport()
+                            } else {
+                                viewModel.triggerWorkspaceExport()
+                            }
                             true
                         }
                         event.key == Key.Spacebar -> {
@@ -214,7 +203,7 @@ private fun XonixStudioApp(
                         event.key == Key.Delete -> {
                             when (activeWorkspace) {
                                 StudioWorkspace.VIDEO -> viewModel.deleteSelectedClip()
-                                StudioWorkspace.PHOTO -> photoState.selectedLayerId?.let { viewModel.deletePhotoLayer(it) }
+                                StudioWorkspace.PHOTO -> viewModel.photoState.value.selectedLayerId?.let { viewModel.deletePhotoLayer(it) }
                                 else -> Unit
                             }
                             true
@@ -237,7 +226,13 @@ private fun XonixStudioApp(
                         onQuickSave = { viewModel.saveCurrentWorkspaceSnapshot() },
                         onShareApp = { viewModel.shareAppWithFriends() },
                         onOpenProfile = { showProfileSheet = true },
-                        onExport = { viewModel.triggerWorkspaceExport() }
+                        onExport = {
+                            if (activeWorkspace == StudioWorkspace.VIDEO) {
+                                viewModel.requestOpenVideoExport()
+                            } else {
+                                viewModel.triggerWorkspaceExport()
+                            }
+                        }
                     )
                 },
                 snackbarHost = {
@@ -319,38 +314,20 @@ private fun XonixStudioApp(
 
                     Box(modifier = Modifier.weight(1f).fillMaxHeight()) {
                         when (activeWorkspace) {
-                            StudioWorkspace.HOME -> HomeHubScreen(
-                                currentUser = activeUser,
-                                projects = vaultProjects,
-                                onStartCreating = { viewModel.selectWorkspace(StudioWorkspace.VIDEO) },
-                                onPickMediaToStart = { uris -> viewModel.importVideoClipsAndOpenEditor(uris) },
-                                onOpenWorkspace = { viewModel.selectWorkspace(it) },
-                                onOpen4KEnhancer = { viewModel.openVideoEnhancerShortcut() },
-                                onResumeProject = { viewModel.resumeVaultProject(it) },
-                                onDeleteProject = { viewModel.deleteVaultProject(it) },
-                                onShareApp = { viewModel.shareAppWithFriends() }
-                            )
-                            StudioWorkspace.VIDEO -> VideoEditorWorkspace(
-                                state = videoState,
-                                previewBitmap = videoPreview,
-                                clipThumbnails = clipThumbnails,
-                                encoderCapabilities = encoderCapabilities,
-                                viewModel = viewModel,
-                                openEnhanceRequested = openEnhanceRequested,
-                                onConsumeEnhanceRequest = { viewModel.consumeVideoEnhanceRequest() }
-                            )
-                            StudioWorkspace.PHOTO -> PhotoStudioWorkspace(
-                                state = photoState,
-                                previewBitmap = photoPreview,
+                            StudioWorkspace.HOME -> HomeWorkspaceHost(
+                                activeUser = activeUser,
                                 viewModel = viewModel
                             )
-                            StudioWorkspace.AUDIO -> AudioStudioWorkspace(
-                                state = audioState,
+                            StudioWorkspace.VIDEO -> VideoWorkspaceHost(
                                 viewModel = viewModel
                             )
-                            StudioWorkspace.VAULT -> UtilitiesVaultWorkspace(
-                                state = utilitiesState,
-                                projects = vaultProjects,
+                            StudioWorkspace.PHOTO -> PhotoWorkspaceHost(
+                                viewModel = viewModel
+                            )
+                            StudioWorkspace.AUDIO -> AudioWorkspaceHost(
+                                viewModel = viewModel
+                            )
+                            StudioWorkspace.VAULT -> VaultWorkspaceHost(
                                 viewModel = viewModel
                             )
                         }
@@ -361,6 +338,7 @@ private fun XonixStudioApp(
 
         // Profile Bottom Sheet (includes Owner-Only Admin Dashboard button strictly when isOwner == true)
         if (showProfileSheet) {
+            val userLoginHistory by viewModel.currentUserLoginHistory.collectAsStateWithLifecycle()
             ProfileBottomSheet(
                 user = activeUser,
                 isOwner = isOwner,
@@ -388,6 +366,8 @@ private fun XonixStudioApp(
 
         // Owner-Only 6-Digit Master PIN Unlock Dialog (with 24-hour lockout after 3 failed attempts)
         if (showAdminPinDialog && isOwner) {
+            val adminPinMessage by viewModel.adminPinMessage.collectAsStateWithLifecycle()
+            val adminLockoutMs by viewModel.adminLockoutMs.collectAsStateWithLifecycle()
             AdminPinUnlockDialog(
                 lockoutRemainingMs = adminLockoutMs,
                 statusMessage = adminPinMessage,
@@ -402,6 +382,8 @@ private fun XonixStudioApp(
 
         // Owner-Only Admin Dashboard Full-Screen Overlay
         if (isAdminUnlocked && isOwner) {
+            val allUsers by viewModel.allUsers.collectAsStateWithLifecycle()
+            val allLoginHistory by viewModel.allLoginHistory.collectAsStateWithLifecycle()
             AdminDashboardScreen(
                 currentOwnerId = activeUser.id,
                 users = allUsers,
@@ -411,4 +393,83 @@ private fun XonixStudioApp(
             )
         }
     }
+}
+
+@Composable
+private fun HomeWorkspaceHost(
+    activeUser: com.example.data.UserAccountEntity,
+    viewModel: XonixStudioViewModel
+) {
+    val vaultProjects by viewModel.vaultProjects.collectAsStateWithLifecycle()
+    HomeHubScreen(
+        currentUser = activeUser,
+        projects = vaultProjects,
+        onStartCreating = { viewModel.selectWorkspace(StudioWorkspace.VIDEO) },
+        onPickMediaToStart = { uris -> viewModel.importVideoClipsAndOpenEditor(uris) },
+        onOpenWorkspace = { viewModel.selectWorkspace(it) },
+        onOpen4KEnhancer = { viewModel.openVideoEnhancerShortcut() },
+        onResumeProject = { viewModel.resumeVaultProject(it) },
+        onDeleteProject = { viewModel.deleteVaultProject(it) },
+        onShareApp = { viewModel.shareAppWithFriends() }
+    )
+}
+
+@Composable
+private fun VideoWorkspaceHost(
+    viewModel: XonixStudioViewModel
+) {
+    val videoState by viewModel.videoState.collectAsStateWithLifecycle()
+    val videoPreview by viewModel.videoPreviewBitmap.collectAsStateWithLifecycle()
+    val clipThumbnails by viewModel.clipThumbnails.collectAsStateWithLifecycle()
+    val encoderCapabilities by viewModel.encoderCapabilities.collectAsStateWithLifecycle()
+    val openEnhanceRequested by viewModel.openVideoEnhanceRequested.collectAsStateWithLifecycle()
+    val openExportRequested by viewModel.openVideoExportRequested.collectAsStateWithLifecycle()
+    VideoEditorWorkspace(
+        state = videoState,
+        previewBitmap = videoPreview,
+        clipThumbnails = clipThumbnails,
+        encoderCapabilities = encoderCapabilities,
+        viewModel = viewModel,
+        openEnhanceRequested = openEnhanceRequested,
+        onConsumeEnhanceRequest = { viewModel.consumeVideoEnhanceRequest() },
+        openExportRequested = openExportRequested,
+        onConsumeExportRequest = { viewModel.consumeVideoExportRequest() }
+    )
+}
+
+@Composable
+private fun PhotoWorkspaceHost(
+    viewModel: XonixStudioViewModel
+) {
+    val photoState by viewModel.photoState.collectAsStateWithLifecycle()
+    val photoPreview by viewModel.photoPreviewBitmap.collectAsStateWithLifecycle()
+    PhotoStudioWorkspace(
+        state = photoState,
+        previewBitmap = photoPreview,
+        viewModel = viewModel
+    )
+}
+
+@Composable
+private fun AudioWorkspaceHost(
+    viewModel: XonixStudioViewModel
+) {
+    val audioState by viewModel.audioState.collectAsStateWithLifecycle()
+    AudioStudioWorkspace(
+        state = audioState,
+        viewModel = viewModel
+    )
+}
+
+@Composable
+private fun VaultWorkspaceHost(
+    viewModel: XonixStudioViewModel
+) {
+    val utilitiesState by viewModel.utilitiesState.collectAsStateWithLifecycle()
+    val vaultProjects by viewModel.vaultProjects.collectAsStateWithLifecycle()
+    UtilitiesVaultWorkspace(
+        state = utilitiesState,
+        projects = vaultProjects,
+        viewModel = viewModel
+    )
 }
