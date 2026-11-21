@@ -1487,7 +1487,8 @@ object ImageProcessingEngine {
         flashOverlayAlpha: Float = 0f,
         flashOverlayColor: Int = Color.WHITE,
         activeTexts: List<com.example.model.VideoTextOverlay> = emptyList(),
-        playheadMs: Long = 0L
+        playheadMs: Long = 0L,
+        previousFrame: Bitmap? = null
     ): Bitmap {
         val output = Bitmap.createBitmap(targetW, targetH, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(output)
@@ -1530,6 +1531,22 @@ object ImageProcessingEngine {
                     canvas.drawColor(bgFillColorArgb)
                 }
             }
+        }
+
+        // 1b. Optional Outgoing Clip Backdrop during Multi-Clip Transitions
+        if (previousFrame != null && !previousFrame.isRecycled) {
+            val prevFit = min(targetW.toFloat() / previousFrame.width, targetH.toFloat() / previousFrame.height)
+            val prevScale = prevFit * cropZoom.coerceIn(0.25f, 3.0f)
+            val prevW = previousFrame.width * prevScale
+            val prevH = previousFrame.height * prevScale
+            val prevCx = targetW / 2f + panX * targetW * 0.4f
+            val prevCy = targetH / 2f + panY * targetH * 0.4f
+            canvas.drawBitmap(
+                previousFrame,
+                null,
+                RectF(prevCx - prevW / 2f, prevCy - prevH / 2f, prevCx + prevW / 2f, prevCy + prevH / 2f),
+                Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+            )
         }
 
         // 2. Main Framed Video with HSL + ColorMatrix + LUT + Keyframes + Clip Transforms

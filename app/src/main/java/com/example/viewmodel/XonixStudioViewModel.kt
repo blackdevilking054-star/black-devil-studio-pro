@@ -3,6 +3,7 @@ package com.example.viewmodel
 import android.app.Application
 import android.graphics.Bitmap
 import android.net.Uri
+import android.os.SystemClock
 import android.provider.OpenableColumns
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -195,6 +196,9 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
     private val _openVideoExportRequested = MutableStateFlow(false)
     val openVideoExportRequested: StateFlow<Boolean> = _openVideoExportRequested.asStateFlow()
 
+    private val _videoSourceAspect = MutableStateFlow(16f / 9f)
+    val videoSourceAspect: StateFlow<Float> = _videoSourceAspect.asStateFlow()
+
     private var videoRenderJob: Job? = null
     private var photoRenderJob: Job? = null
     private val videoRenderDirty = AtomicBoolean(false)
@@ -202,6 +206,7 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
     private val photoRenderDirty = AtomicBoolean(false)
     private val photoRenderImmediate = AtomicBoolean(false)
     private var playbackJob: Job? = null
+    private var fxPreviewJob: Job? = null
     private var audioPlayJob: Job? = null
     private var micRecordJob: Job? = null
     private var videoVoiceRecordJob: Job? = null
@@ -474,6 +479,7 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
                 val rendered = withContext(Dispatchers.Default) {
                     VideoMediaEngine.renderPreviewAtPlayhead(appContext, snapshot, maxEdge = targetEdge)
                 }
+                _videoSourceAspect.value = VideoMediaEngine.lastRenderedSourceAspect
                 _videoPreviewBitmap.value = rendered
             }
         }
@@ -1254,42 +1260,102 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
     }
 
     fun seekPlayhead(ms: Long) {
+        fxPreviewJob?.cancel()
         _videoState.update { it.copy(playheadMs = ms.coerceIn(0L, it.totalDurationMs)) }
         scheduleVideoPreviewRender(immediate = true)
     }
 
+    fun selectClipTransition(transition: VideoTransition) {
+        updateSelectedClip { it.copy(transitionAfter = transition) }
+        fxPreviewJob?.cancel()
+        if (transition == VideoTransition.NONE) {
+            scheduleVideoPreviewRender(immediate = true)
+            return
+        }
+        val state = _videoState.value
+        val sel = state.selectedClip ?: return
+        val selIdx = state.clips.indexOfFirst { it.id == sel.id }.coerceAtLeast(0)
+        var clipStartMs = 0L
+        for (i in 0 until selIdx) clipStartMs += state.clips[i].effectiveDurationMs
+        val durMs = sel.transitionDurationMs.coerceIn(250L, 3000L)
+        val hasNextClip = selIdx < state.clips.lastIndex
+        val previewStartMs = if (hasNextClip) {
+            (clipStartMs + sel.effectiveDurationMs - (durMs / 3L)).coerceAtLeast(clipStartMs)
+        } else {
+            clipStartMs
+        }
+        val previewEndMs = (if (hasNextClip) clipStartMs + sel.effectiveDurationMs + durMs else clipStartMs + durMs)
+            .coerceAtMost(state.totalDurationMs)
+
+        // Immediately play a smooth live preview burst across the FX/Transition window on canvas
+        if (!state.isPlaying) {
+            fxPreviewJob = viewModelScope.launch {
+                val frameBudgetMs = 33L
+                var curMs = previewStartMs
+                while (isActive && curMs <= previewEndMs) {
+                    val t0 = SystemClock.elapsedRealtime()
+                    _videoState.update { it.copy(playheadMs = curMs.coerceIn(0L, it.totalDurationMs)) }
+                    val rendered = withContext(Dispatchers.Default) {
+                        VideoMediaEngine.renderPreviewAtPlayhead(appContext, _videoState.value, maxEdge = 540)
+                    }
+                    _videoSourceAspect.value = VideoMediaEngine.lastRenderedSourceAspect
+                    _videoPreviewBitmap.value = rendered
+                    val elapsed = (SystemClock.elapsedRealtime() - t0).coerceAtLeast(1L)
+                    val waitMs = (frameBudgetMs - elapsed).coerceAtLeast(6L)
+                    delay(waitMs)
+                    curMs += (elapsed + waitMs).coerceIn(28L, 80L)
+                }
+            }
+        }
+    }
+
     fun toggleVideoPlayback() {
+        fxPreviewJob?.cancel()
         if (_videoState.value.isPlaying) {
             stopVideoPlayback()
         } else {
             _videoState.update { it.copy(isPlaying = true) }
             playbackJob?.cancel()
             playbackJob = viewModelScope.launch {
-                val frameStepMs = 90L
+                val targetStepMs = 33L
+                var lastTickMs = SystemClock.elapsedRealtime()
                 while (isActive && _videoState.value.isPlaying) {
+                    val nowMs = SystemClock.elapsedRealtime()
+                    val deltaMs = (nowMs - lastTickMs).coerceIn(16L, 95L)
+                    lastTickMs = nowMs
                     val s = _videoState.value
-                    val next = s.playheadMs + frameStepMs
+                    val next = s.playheadMs + deltaMs
                     if (next >= s.totalDurationMs) {
                         if (s.loopPlayback) {
                             _videoState.update { it.copy(playheadMs = 0L) }
                         } else {
                             _videoState.update { it.copy(isPlaying = false, playheadMs = s.totalDurationMs) }
+                            val finalBmp = withContext(Dispatchers.Default) {
+                                VideoMediaEngine.renderPreviewAtPlayhead(appContext, _videoState.value, maxEdge = 640)
+                            }
+                            _videoSourceAspect.value = VideoMediaEngine.lastRenderedSourceAspect
+                            _videoPreviewBitmap.value = finalBmp
                             break
                         }
                     } else {
                         _videoState.update { it.copy(playheadMs = next) }
                     }
+                    val renderStart = SystemClock.elapsedRealtime()
                     val rendered = withContext(Dispatchers.Default) {
-                        VideoMediaEngine.renderPreviewAtPlayhead(appContext, _videoState.value, maxEdge = 640)
+                        VideoMediaEngine.renderPreviewAtPlayhead(appContext, _videoState.value, maxEdge = 540)
                     }
+                    _videoSourceAspect.value = VideoMediaEngine.lastRenderedSourceAspect
                     _videoPreviewBitmap.value = rendered
-                    delay(frameStepMs)
+                    val renderElapsed = SystemClock.elapsedRealtime() - renderStart
+                    val sleepMs = (targetStepMs - renderElapsed).coerceAtLeast(8L)
+                    delay(sleepMs)
                 }
             }
         }
     }
 
     fun stopVideoPlayback() {
+        fxPreviewJob?.cancel()
         playbackJob?.cancel()
         _videoState.update { it.copy(isPlaying = false) }
     }

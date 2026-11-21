@@ -231,6 +231,40 @@ object VideoMediaEngine {
         return InterpolatedKeyframe()
     }
 
+    private data class CachedSourceFrame(
+        val key: String,
+        val bitmap: Bitmap
+    )
+
+    private val retrieverLock = Any()
+    private val retrieverCache = LinkedHashMap<String, MediaMetadataRetriever>(3, 0.75f, true)
+    @Volatile
+    private var cachedFrame: CachedSourceFrame? = null
+
+    @Volatile
+    var lastRenderedSourceAspect: Float = 16f / 9f
+        private set
+
+    private fun getOrOpenRetriever(context: Context, uriString: String): MediaMetadataRetriever? {
+        synchronized(retrieverLock) {
+            retrieverCache[uriString]?.let { return it }
+            return try {
+                val r = MediaMetadataRetriever()
+                r.setDataSource(context, Uri.parse(uriString))
+                if (retrieverCache.size >= 2) {
+                    val oldestKey = retrieverCache.keys.firstOrNull()
+                    if (oldestKey != null) {
+                        runCatching { retrieverCache.remove(oldestKey)?.release() }
+                    }
+                }
+                retrieverCache[uriString] = r
+                r
+            } catch (_: Exception) {
+                null
+            }
+        }
+    }
+
     fun extractClipFrame(
         context: Context,
         clip: VideoClip,
@@ -245,23 +279,37 @@ object VideoMediaEngine {
             (safeStart + localClipMs).coerceIn(safeStart, safeEnd)
         }
 
+        // Quantize preview frame lookup to 65ms buckets so 30fps FX/Transition animations run silky-smooth
+        val bucketMs = if (maxEdge <= 800) (clampedMs / 65L) * 65L else clampedMs
+        val cacheKey = "${clip.id}|${clip.uriString ?: clip.fallbackDrawable}|$bucketMs|$maxEdge"
+        val existing = cachedFrame
+        if (existing != null && existing.key == cacheKey && !existing.bitmap.isRecycled) {
+            return existing.bitmap
+        }
+
         if (!clip.uriString.isNullOrBlank()) {
-            val retriever = MediaMetadataRetriever()
-            try {
-                retriever.setDataSource(context, Uri.parse(clip.uriString))
-                val frame = retriever.getFrameAtTime(
-                    clampedMs * 1000L,
-                    MediaMetadataRetriever.OPTION_CLOSEST_SYNC
-                )
-                if (frame != null) {
-                    val scaled = scaleDownIfNeeded(frame, maxEdge)
-                    if (scaled != frame) frame.recycle()
-                    return scaled
+            val retriever = getOrOpenRetriever(context, clip.uriString)
+            if (retriever != null) {
+                try {
+                    val frame = synchronized(retrieverLock) {
+                        retriever.getFrameAtTime(
+                            bucketMs * 1000L,
+                            MediaMetadataRetriever.OPTION_CLOSEST_SYNC
+                        )
+                    }
+                    if (frame != null) {
+                        val scaled = scaleDownIfNeeded(frame, maxEdge)
+                        if (scaled != frame) frame.recycle()
+                        if (maxEdge <= 800) {
+                            cachedFrame = CachedSourceFrame(cacheKey, scaled)
+                        }
+                        return scaled
+                    }
+                } catch (_: Exception) {
+                    synchronized(retrieverLock) {
+                        runCatching { retrieverCache.remove(clip.uriString)?.release() }
+                    }
                 }
-            } catch (_: Exception) {
-                // Fall back to sample drawable
-            } finally {
-                runCatching { retriever.release() }
             }
         }
 
@@ -271,9 +319,13 @@ object VideoMediaEngine {
             fallbackDrawable = clip.fallbackDrawable ?: R.drawable.img_studio_sample_bg_1795185351810,
             maxDimension = maxEdge
         )
-        return fallback ?: Bitmap.createBitmap(320, 180, Bitmap.Config.ARGB_8888).apply {
+        val result = fallback ?: Bitmap.createBitmap(320, 180, Bitmap.Config.ARGB_8888).apply {
             eraseColor(Color.rgb(12, 8, 16))
         }
+        if (maxEdge <= 800) {
+            cachedFrame = CachedSourceFrame(cacheKey, result)
+        }
+        return result
     }
 
     private fun scaleDownIfNeeded(bmp: Bitmap, maxEdge: Int): Bitmap {
@@ -301,6 +353,162 @@ object VideoMediaEngine {
         } finally {
             rendered.recycle()
         }
+    }
+
+    private data class TransitionFxValues(
+        val alpha: Float = 1f,
+        val offsetX: Float = 0f,
+        val offsetY: Float = 0f,
+        val scale: Float = 1f,
+        val rotation: Float = 0f,
+        val glitch: Float = 0f,
+        val blur: Float = 0f,
+        val wipeProgress: Float = 1f,
+        val wipeVertical: Boolean = false,
+        val splitProgress: Float = 1f,
+        val flashAlpha: Float = 0f,
+        val flashColor: Int = Color.WHITE
+    )
+
+    private fun isContinuousClipFx(transition: VideoTransition): Boolean {
+        return when (transition) {
+            VideoTransition.SHAKE,
+            VideoTransition.EARTHQUAKE,
+            VideoTransition.IMPACT_HIT,
+            VideoTransition.HANDHELD_JOLT,
+            VideoTransition.GLITCH_RGB,
+            VideoTransition.PIXEL_SPLIT,
+            VideoTransition.SCANLINE,
+            VideoTransition.CHROMATIC,
+            VideoTransition.STROBE,
+            VideoTransition.VHS_TRACKING -> true
+            else -> false
+        }
+    }
+
+    private fun computeTransitionFx(
+        transition: VideoTransition,
+        pRaw: Float,
+        timeMs: Long,
+        continuousMode: Boolean = false
+    ): TransitionFxValues {
+        if (transition == VideoTransition.NONE) return TransitionFxValues()
+        val p = pRaw.coerceIn(0f, 1f)
+        // Smooth ease-out curve so live motion feels snappy and cinematic
+        val eased = 1f - (1f - p) * (1f - p)
+        val inv = if (continuousMode) {
+            // Smooth pulsing wave across continuous FX cycles (never flat 0)
+            0.45f + 0.55f * kotlin.math.abs(kotlin.math.sin(p * Math.PI)).toFloat()
+        } else {
+            1f - eased
+        }
+
+        var tAlpha = 1f
+        var tOffsetX = 0f
+        var tOffsetY = 0f
+        var tScale = 1f
+        var tRotation = 0f
+        var tGlitch = 0f
+        var tBlur = 0f
+        var tWipeProgress = 1f
+        var tWipeVertical = false
+        var tSplitProgress = 1f
+        var flashAlpha = 0f
+        var flashColor = Color.WHITE
+
+        when (transition) {
+            VideoTransition.NONE -> Unit
+            VideoTransition.CROSSFADE -> tAlpha = 0.15f + 0.85f * eased
+            VideoTransition.DIP_TO_BLACK -> tAlpha = eased
+            VideoTransition.DIP_TO_WHITE -> { flashColor = Color.WHITE; flashAlpha = inv * 0.92f }
+            VideoTransition.WIPE_LEFT -> { tWipeProgress = eased.coerceAtLeast(0.03f); tWipeVertical = false }
+            VideoTransition.WIPE_RIGHT -> { tWipeProgress = eased.coerceAtLeast(0.03f); tWipeVertical = false; tOffsetX = -inv * 0.25f }
+            VideoTransition.WIPE_UP -> { tWipeProgress = eased.coerceAtLeast(0.03f); tWipeVertical = true }
+            VideoTransition.WIPE_DOWN -> { tWipeProgress = eased.coerceAtLeast(0.03f); tWipeVertical = true; tOffsetY = -inv * 0.25f }
+
+            VideoTransition.WHIP_PAN -> { tOffsetX = inv * 0.95f; tBlur = inv * 0.85f; tScale = 1f + inv * 0.08f }
+            VideoTransition.WHIP_UP -> { tOffsetY = inv * 0.95f; tBlur = inv * 0.85f; tScale = 1f + inv * 0.08f }
+            VideoTransition.SLIDE_LEFT -> tOffsetX = inv
+            VideoTransition.SLIDE_RIGHT -> tOffsetX = -inv
+            VideoTransition.SLIDE_UP -> tOffsetY = inv
+            VideoTransition.SLIDE_DOWN -> tOffsetY = -inv
+
+            VideoTransition.GLITCH_RGB -> {
+                tGlitch = inv
+                tOffsetX = (if ((timeMs / 45L) % 2L == 0L) 0.038f else -0.038f) * inv
+            }
+            VideoTransition.PIXEL_SPLIT -> {
+                tGlitch = inv * 0.9f
+                tSplitProgress = if (continuousMode) 0.72f + 0.28f * eased else 0.30f + 0.70f * eased
+            }
+            VideoTransition.SCANLINE -> { tGlitch = inv * 0.75f; tAlpha = 0.55f + 0.45f * eased }
+            VideoTransition.CHROMATIC -> { tGlitch = inv * 1.15f; tScale = 1.0f + inv * 0.14f }
+            VideoTransition.STROBE -> {
+                val pulse = (timeMs / 60L) % 2L == 0L
+                tAlpha = if (pulse) 1f else 0.30f
+                flashAlpha = if (pulse) inv * 0.52f else 0f
+            }
+            VideoTransition.VHS_TRACKING -> {
+                tGlitch = inv * 0.95f
+                tOffsetY = kotlin.math.sin(p * Math.PI * 10.0).toFloat() * inv * 0.06f
+                tBlur = inv * 0.35f
+            }
+
+            VideoTransition.ZOOM_IN -> tScale = 1.48f - 0.48f * eased
+            VideoTransition.ZOOM_OUT -> tScale = 0.58f + 0.42f * eased
+            VideoTransition.SPIN_360 -> { tRotation = inv * 360f; tScale = 0.68f + 0.32f * eased }
+            VideoTransition.SPIN_LEFT -> { tRotation = -inv * 360f; tScale = 0.72f + 0.28f * eased }
+            VideoTransition.SWIRL_ZOOM -> { tRotation = inv * 180f; tScale = 1.52f - 0.52f * eased; tBlur = inv * 0.45f }
+            VideoTransition.CRASH_ZOOM -> { tScale = 1.92f - 0.92f * eased; tBlur = inv * 0.6f }
+
+            VideoTransition.SHAKE -> {
+                tOffsetX = kotlin.math.sin(p * Math.PI * 8.0).toFloat() * inv * 0.085f
+                tOffsetY = kotlin.math.cos(p * Math.PI * 7.0).toFloat() * inv * 0.065f
+                tScale = 1.06f
+            }
+            VideoTransition.EARTHQUAKE -> {
+                tOffsetX = kotlin.math.sin(p * Math.PI * 14.0).toFloat() * inv * 0.13f
+                tOffsetY = kotlin.math.cos(p * Math.PI * 11.0).toFloat() * inv * 0.10f
+                tScale = 1.10f
+            }
+            VideoTransition.IMPACT_HIT -> {
+                tScale = 1.0f + inv * 0.28f
+                tOffsetY = kotlin.math.sin(p * Math.PI * 8.0).toFloat() * inv * 0.09f
+                flashAlpha = inv * 0.35f
+            }
+            VideoTransition.HANDHELD_JOLT -> {
+                tRotation = kotlin.math.sin(p * Math.PI * 6.0).toFloat() * inv * 8.5f
+                tOffsetX = kotlin.math.cos(p * Math.PI * 7.0).toFloat() * inv * 0.075f
+                tScale = 1.07f
+            }
+
+            VideoTransition.SPLIT -> tSplitProgress = eased.coerceAtLeast(0.03f)
+            VideoTransition.SPLIT_VERTICAL -> { tSplitProgress = eased.coerceAtLeast(0.03f); tOffsetY = inv * 0.14f }
+            VideoTransition.CURTAIN_OPEN -> { tSplitProgress = eased.coerceAtLeast(0.03f); tAlpha = 0.4f + 0.6f * eased }
+            VideoTransition.SHUTTER_SPLIT -> { tSplitProgress = eased.coerceAtLeast(0.03f); tBlur = inv * 0.4f; flashColor = Color.BLACK; flashAlpha = inv * 0.25f }
+
+            VideoTransition.FLASH -> { flashColor = Color.WHITE; flashAlpha = inv * 0.95f }
+            VideoTransition.BLUR -> tBlur = inv * 0.95f
+            VideoTransition.LIGHT_LEAK -> { flashColor = Color.rgb(255, 165, 55); flashAlpha = inv * 0.78f }
+            VideoTransition.GLOW_BURN -> { flashColor = Color.rgb(255, 30, 66); flashAlpha = inv * 0.72f; tScale = 1.0f + inv * 0.16f }
+            VideoTransition.RADIAL_FLASH -> { flashColor = Color.rgb(255, 240, 190); flashAlpha = inv * 0.85f; tBlur = inv * 0.45f }
+            VideoTransition.CRIMSON_FLASH -> { flashColor = Color.rgb(255, 30, 66); flashAlpha = inv * 0.92f; tScale = 1.0f + inv * 0.10f }
+        }
+
+        return TransitionFxValues(
+            alpha = tAlpha,
+            offsetX = tOffsetX,
+            offsetY = tOffsetY,
+            scale = tScale,
+            rotation = tRotation,
+            glitch = tGlitch,
+            blur = tBlur,
+            wipeProgress = tWipeProgress,
+            wipeVertical = tWipeVertical,
+            splitProgress = tSplitProgress,
+            flashAlpha = flashAlpha,
+            flashColor = flashColor
+        )
     }
 
     fun renderPreviewAtPlayhead(
@@ -344,106 +552,64 @@ object VideoMediaEngine {
         }
 
         // Apply Speed Curve Ramping on local timeline progress
-        val normProgress = (localTimelineMs.toFloat() / activeClip.effectiveDurationMs.coerceAtLeast(1L).toFloat()).coerceIn(0f, 1f)
+        val activeDurMs = activeClip.effectiveDurationMs.coerceAtLeast(1L)
+        val normProgress = (localTimelineMs.toFloat() / activeDurMs.toFloat()).coerceIn(0f, 1f)
         val curvedProgress = remapProgressWithSpeedCurve(normProgress, activeClip.speedCurve)
         val clipSpanMs = (activeClip.trimEndMs - activeClip.trimStartMs).coerceAtLeast(300L)
         val sourceLocalMs = (curvedProgress * clipSpanMs).toLong()
         val srcFrame = extractClipFrame(context, activeClip, sourceLocalMs, maxEdge)
+        lastRenderedSourceAspect = srcFrame.width.toFloat() / srcFrame.height.toFloat().coerceAtLeast(1f)
 
         // Interpolate Diamond Keyframes on the active clip
         val kf = interpolateKeyframes(activeClip.keyframes, localTimelineMs)
 
-        // Transition animation near clip boundary
-        var tAlpha = 1f
-        var tOffsetX = 0f
-        var tOffsetY = 0f
-        var tScale = 1f
-        var tRotation = 0f
-        var tGlitch = 0f
-        var tBlur = 0f
-        var tWipeProgress = 1f
-        var tWipeVertical = false
-        var tSplitProgress = 1f
-        var flashAlpha = 0f
-        var flashColor = Color.WHITE
+        // Live FX & Transition Animation (works seamlessly on BOTH multi-clip seams AND single-clip / active-clip FX)
+        var fx = TransitionFxValues()
+        var prevClipBackdrop: Bitmap? = null
 
-        if (activeIdx > 0) {
-            val prevClip = clips[activeIdx - 1]
-            val durMs = prevClip.transitionDurationMs.coerceIn(100L, 3000L)
-            if (localTimelineMs < durMs) {
-                val p = (localTimelineMs.toFloat() / durMs.toFloat()).coerceIn(0f, 1f)
-                val inv = 1f - p
-                when (prevClip.transitionAfter) {
-                    VideoTransition.NONE -> Unit
-                    VideoTransition.CROSSFADE -> tAlpha = 0.2f + 0.8f * p
-                    VideoTransition.DIP_TO_BLACK -> tAlpha = p
-                    VideoTransition.DIP_TO_WHITE -> { flashColor = Color.WHITE; flashAlpha = inv * 0.92f }
-                    VideoTransition.WIPE_LEFT -> { tWipeProgress = p; tWipeVertical = false }
-                    VideoTransition.WIPE_RIGHT -> { tWipeProgress = p; tWipeVertical = false; tOffsetX = -inv * 0.2f }
-                    VideoTransition.WIPE_UP -> { tWipeProgress = p; tWipeVertical = true }
-                    VideoTransition.WIPE_DOWN -> { tWipeProgress = p; tWipeVertical = true; tOffsetY = -inv * 0.2f }
+        val prevClip = if (activeIdx > 0) clips[activeIdx - 1] else null
+        val incomingDurMs = prevClip?.transitionDurationMs?.coerceIn(100L, 3000L) ?: 500L
+        val activeFxDurMs = activeClip.transitionDurationMs.coerceIn(100L, 3000L)
+        val remainingMs = (activeDurMs - localTimelineMs).coerceAtLeast(0L)
 
-                    VideoTransition.WHIP_PAN -> { tOffsetX = inv * 0.9f; tBlur = inv * 0.85f }
-                    VideoTransition.WHIP_UP -> { tOffsetY = inv * 0.9f; tBlur = inv * 0.85f }
-                    VideoTransition.SLIDE_LEFT -> tOffsetX = inv
-                    VideoTransition.SLIDE_RIGHT -> tOffsetX = -inv
-                    VideoTransition.SLIDE_UP -> tOffsetY = inv
-                    VideoTransition.SLIDE_DOWN -> tOffsetY = -inv
-
-                    VideoTransition.GLITCH_RGB -> {
-                        tGlitch = inv
-                        tOffsetX = (if ((localTimelineMs / 45L) % 2L == 0L) 0.03f else -0.03f) * inv
-                    }
-                    VideoTransition.PIXEL_SPLIT -> { tGlitch = inv * 0.85f; tSplitProgress = 0.35f + 0.65f * p }
-                    VideoTransition.SCANLINE -> { tGlitch = inv * 0.65f; tAlpha = 0.5f + 0.5f * p }
-                    VideoTransition.CHROMATIC -> { tGlitch = inv * 1.1f; tScale = 1.12f - 0.12f * p }
-                    VideoTransition.STROBE -> {
-                        tAlpha = if ((localTimelineMs / 55L) % 2L == 0L) 1f else 0.28f
-                        flashAlpha = if ((localTimelineMs / 55L) % 2L == 0L) inv * 0.5f else 0f
-                    }
-                    VideoTransition.VHS_TRACKING -> {
-                        tGlitch = inv * 0.95f
-                        tOffsetY = kotlin.math.sin(p * Math.PI * 10.0).toFloat() * inv * 0.05f
-                        tBlur = inv * 0.35f
-                    }
-
-                    VideoTransition.ZOOM_IN -> tScale = 1.38f - 0.38f * p
-                    VideoTransition.ZOOM_OUT -> tScale = 0.65f + 0.35f * p
-                    VideoTransition.SPIN_360 -> { tRotation = inv * 360f; tScale = 0.72f + 0.28f * p }
-                    VideoTransition.SPIN_LEFT -> { tRotation = -inv * 360f; tScale = 0.76f + 0.24f * p }
-                    VideoTransition.SWIRL_ZOOM -> { tRotation = inv * 180f; tScale = 1.45f - 0.45f * p; tBlur = inv * 0.45f }
-                    VideoTransition.CRASH_ZOOM -> { tScale = 1.85f - 0.85f * p; tBlur = inv * 0.6f }
-
-                    VideoTransition.SHAKE -> {
-                        tOffsetX = kotlin.math.sin(p * Math.PI * 6.0).toFloat() * inv * 0.08f
-                        tOffsetY = kotlin.math.cos(p * Math.PI * 5.0).toFloat() * inv * 0.06f
-                    }
-                    VideoTransition.EARTHQUAKE -> {
-                        tOffsetX = kotlin.math.sin(p * Math.PI * 14.0).toFloat() * inv * 0.13f
-                        tOffsetY = kotlin.math.cos(p * Math.PI * 11.0).toFloat() * inv * 0.10f
-                        tScale = 1.08f
-                    }
-                    VideoTransition.IMPACT_HIT -> {
-                        tScale = 1.24f - 0.24f * p
-                        tOffsetY = kotlin.math.sin(p * Math.PI * 8.0).toFloat() * inv * 0.09f
-                        flashAlpha = inv * 0.35f
-                    }
-                    VideoTransition.HANDHELD_JOLT -> {
-                        tRotation = kotlin.math.sin(p * Math.PI * 6.0).toFloat() * inv * 8f
-                        tOffsetX = kotlin.math.cos(p * Math.PI * 7.0).toFloat() * inv * 0.07f
-                    }
-
-                    VideoTransition.SPLIT -> tSplitProgress = p
-                    VideoTransition.SPLIT_VERTICAL -> { tSplitProgress = p; tOffsetY = inv * 0.12f }
-                    VideoTransition.CURTAIN_OPEN -> { tSplitProgress = p; tAlpha = 0.4f + 0.6f * p }
-                    VideoTransition.SHUTTER_SPLIT -> { tSplitProgress = p; tBlur = inv * 0.4f; flashColor = Color.BLACK; flashAlpha = inv * 0.25f }
-
-                    VideoTransition.FLASH -> { flashColor = Color.WHITE; flashAlpha = inv * 0.95f }
-                    VideoTransition.BLUR -> tBlur = inv * 0.95f
-                    VideoTransition.LIGHT_LEAK -> { flashColor = Color.rgb(255, 165, 55); flashAlpha = inv * 0.78f }
-                    VideoTransition.GLOW_BURN -> { flashColor = Color.rgb(255, 30, 66); flashAlpha = inv * 0.72f; tScale = 1.15f - 0.15f * p }
-                    VideoTransition.RADIAL_FLASH -> { flashColor = Color.rgb(255, 240, 190); flashAlpha = inv * 0.85f; tBlur = inv * 0.45f }
-                    VideoTransition.CRIMSON_FLASH -> { flashColor = Color.rgb(255, 30, 66); flashAlpha = inv * 0.92f; tScale = 1.08f - 0.08f * p }
+        if (prevClip != null && prevClip.transitionAfter != VideoTransition.NONE && localTimelineMs < incomingDurMs) {
+            // 1. Multi-clip incoming transition right after seam (with outgoing clip frame underneath!)
+            val p = (localTimelineMs.toFloat() / incomingDurMs.toFloat()).coerceIn(0f, 1f)
+            fx = computeTransitionFx(prevClip.transitionAfter, p, localTimelineMs, continuousMode = false)
+            val prevSpan = (prevClip.trimEndMs - prevClip.trimStartMs).coerceAtLeast(300L)
+            prevClipBackdrop = extractClipFrame(context, prevClip, prevSpan, maxEdge)
+        } else if (activeClip.transitionAfter != VideoTransition.NONE) {
+            val activeTr = activeClip.transitionAfter
+            if (isContinuousClipFx(activeTr)) {
+                // 2. Continuous Camera Shake / Glitch / VHS FX animates live throughout the clip
+                val cycleP = ((localTimelineMs % activeFxDurMs).toFloat() / activeFxDurMs.toFloat()).coerceIn(0f, 1f)
+                fx = computeTransitionFx(activeTr, cycleP, localTimelineMs, continuousMode = true)
+            } else if (activeIdx < clips.lastIndex) {
+                // 3. Multi-clip outgoing lead-out transition right before seam into next clip
+                val outDurMs = (activeFxDurMs / 2L).coerceIn(120L, 800L)
+                if (remainingMs < outDurMs) {
+                    val outProgress = (remainingMs.toFloat() / outDurMs.toFloat()).coerceIn(0f, 1f)
+                    val leadOut = computeTransitionFx(activeTr, outProgress, localTimelineMs, continuousMode = false)
+                    // Reverse directional travel on exit so Whip Up whips cleanly up & out before the next clip enters
+                    fx = leadOut.copy(
+                        offsetX = -leadOut.offsetX * 0.7f,
+                        offsetY = -leadOut.offsetY * 0.7f,
+                        rotation = -leadOut.rotation * 0.45f
+                    )
+                }
+            } else {
+                // 4. Single-clip or last-clip Motion/Whip/Spin/Zoom/Flash/Wipe FX animates live on intro & outro
+                if (localTimelineMs < activeFxDurMs) {
+                    val p = (localTimelineMs.toFloat() / activeFxDurMs.toFloat()).coerceIn(0f, 1f)
+                    fx = computeTransitionFx(activeTr, p, localTimelineMs, continuousMode = false)
+                } else if (activeDurMs > activeFxDurMs * 2L && remainingMs < activeFxDurMs) {
+                    val p = (remainingMs.toFloat() / activeFxDurMs.toFloat()).coerceIn(0f, 1f)
+                    val outro = computeTransitionFx(activeTr, p, localTimelineMs, continuousMode = false)
+                    fx = outro.copy(
+                        offsetX = -outro.offsetX,
+                        offsetY = -outro.offsetY,
+                        rotation = -outro.rotation
+                    )
                 }
             }
         }
@@ -505,20 +671,21 @@ object VideoMediaEngine {
             pipOpacity = state.pip.opacity,
             pipBlendMode = state.pip.blendMode,
             pipMaskShape = state.pip.maskShape,
-            transitionAlpha = tAlpha,
-            transitionOffsetX = tOffsetX,
-            transitionOffsetY = tOffsetY,
-            transitionScale = tScale,
-            transitionRotationDeg = tRotation,
-            transitionGlitchAmount = tGlitch,
-            transitionBlurAmount = tBlur,
-            transitionWipeProgress = tWipeProgress,
-            transitionWipeVertical = tWipeVertical,
-            transitionSplitProgress = tSplitProgress,
-            flashOverlayAlpha = flashAlpha,
-            flashOverlayColor = flashColor,
+            transitionAlpha = fx.alpha,
+            transitionOffsetX = fx.offsetX,
+            transitionOffsetY = fx.offsetY,
+            transitionScale = fx.scale,
+            transitionRotationDeg = fx.rotation,
+            transitionGlitchAmount = fx.glitch,
+            transitionBlurAmount = fx.blur,
+            transitionWipeProgress = fx.wipeProgress,
+            transitionWipeVertical = fx.wipeVertical,
+            transitionSplitProgress = fx.splitProgress,
+            flashOverlayAlpha = fx.flashAlpha,
+            flashOverlayColor = fx.flashColor,
             activeTexts = state.textLayers,
-            playheadMs = state.playheadMs
+            playheadMs = state.playheadMs,
+            previousFrame = prevClipBackdrop
         )
         if (shouldRecyclePip) pipBmp?.recycle()
         return rendered

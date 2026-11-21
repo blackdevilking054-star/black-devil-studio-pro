@@ -84,7 +84,8 @@ internal fun BoxScope.InteractiveWhiteTransformBox(
     onPinchRotate: (zoom: Float, rotationDeltaDeg: Float) -> Unit = { _, _ -> },
     onTapBox: () -> Unit = {},
     onDoubleTapBox: (() -> Unit)? = null,
-    badgeHint: String? = null
+    badgeHint: String? = null,
+    allowPinchRotate: Boolean = true
 ) {
     val density = LocalDensity.current
     val currentOnScale by rememberUpdatedState(onCornerScaleDelta)
@@ -94,8 +95,9 @@ internal fun BoxScope.InteractiveWhiteTransformBox(
     val currentOnTap by rememberUpdatedState(onTapBox)
     val currentOnDoubleTap by rememberUpdatedState(onDoubleTapBox)
     val currentRotDeg by rememberUpdatedState(rotationDeg)
+    val currentAllowPinchRotate by rememberUpdatedState(allowPinchRotate)
 
-    val handleTopExtraPx = with(density) { 44.dp.roundToPx() }
+    val handleTopExtraPx = with(density) { 56.dp.roundToPx() }
     val handlePadPx = with(density) { 22.dp.roundToPx() }
 
     val totalW = boxW + handlePadPx * 2
@@ -117,16 +119,16 @@ internal fun BoxScope.InteractiveWhiteTransformBox(
             .zIndex(8f)
             .testTag("${tagPrefix}_transform_box")
     ) {
-        // Top 1-Finger Circular Rotation Handle + Stem
+        // Dedicated Top 1-Finger Circular Rotation Handle + Stem (clearly separated above top edge resize handle)
         Column(
             modifier = Modifier
                 .align(Alignment.TopCenter)
-                .zIndex(10f),
+                .zIndex(11f),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             Box(
                 modifier = Modifier
-                    .size(34.dp)
+                    .size(32.dp)
                     .pointerInput(tagPrefix) {
                         detectDragGestures { change, dragAmount ->
                             change.consume()
@@ -156,7 +158,7 @@ internal fun BoxScope.InteractiveWhiteTransformBox(
             Box(
                 modifier = Modifier
                     .width(1.6.dp)
-                    .height(8.dp)
+                    .height(24.dp)
                     .background(Color.White)
             )
         }
@@ -217,7 +219,11 @@ internal fun BoxScope.InteractiveWhiteTransformBox(
                                         var deltaRad = angle - prevAngle
                                         while (deltaRad > PI) deltaRad -= (2.0 * PI).toFloat()
                                         while (deltaRad < -PI) deltaRad += (2.0 * PI).toFloat()
-                                        val rotDeltaDeg = (deltaRad * 180f / PI.toFloat())
+                                        val rotDeltaDeg = if (currentAllowPinchRotate) {
+                                            (deltaRad * 180f / PI.toFloat())
+                                        } else {
+                                            0f
+                                        }
                                         val localDx = centroid.x - prevCentroid.x
                                         val localDy = centroid.y - prevCentroid.y
                                         // Convert local rotated-box delta into parent canvas coordinates
@@ -322,7 +328,7 @@ internal fun BoxScope.InteractiveWhiteTransformBox(
             // Side Edge Resize Handles centered cleanly on exact Left, Right, Top, and Bottom outer edges
             SideResizeHandle(
                 alignment = Alignment.CenterStart,
-                offsetX = (-17).dp,
+                offsetX = (-14).dp,
                 offsetY = 0.dp,
                 isHorizontalBar = false,
                 signX = -1f,
@@ -333,7 +339,7 @@ internal fun BoxScope.InteractiveWhiteTransformBox(
             )
             SideResizeHandle(
                 alignment = Alignment.CenterEnd,
-                offsetX = 17.dp,
+                offsetX = 14.dp,
                 offsetY = 0.dp,
                 isHorizontalBar = false,
                 signX = 1f,
@@ -345,7 +351,7 @@ internal fun BoxScope.InteractiveWhiteTransformBox(
             SideResizeHandle(
                 alignment = Alignment.TopCenter,
                 offsetX = 0.dp,
-                offsetY = (-17).dp,
+                offsetY = (-14).dp,
                 isHorizontalBar = true,
                 signX = 0f,
                 signY = -1f,
@@ -356,7 +362,7 @@ internal fun BoxScope.InteractiveWhiteTransformBox(
             SideResizeHandle(
                 alignment = Alignment.BottomCenter,
                 offsetX = 0.dp,
-                offsetY = 17.dp,
+                offsetY = 14.dp,
                 isHorizontalBar = true,
                 signX = 0f,
                 signY = 1f,
@@ -458,7 +464,7 @@ private fun BoxScope.SideResizeHandle(
         modifier = Modifier
             .align(alignment)
             .offset(x = offsetX, y = offsetY)
-            .size(34.dp)
+            .size(28.dp)
             .zIndex(9f)
             .pointerInput(tag) {
                 detectDragGestures { change, dragAmount ->

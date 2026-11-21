@@ -266,6 +266,7 @@ fun VideoEditorWorkspace(
     val density = LocalDensity.current
     val canUndoVideo by viewModel.canUndoVideo.collectAsStateWithLifecycle()
     val canRedoVideo by viewModel.canRedoVideo.collectAsStateWithLifecycle()
+    val liveSourceAspect by viewModel.videoSourceAspect.collectAsStateWithLifecycle()
     var activeTab by rememberSaveable { mutableStateOf(VideoToolTab.TRIM) }
     var isToolDrawerExpanded by rememberSaveable { mutableStateOf(false) }
     var isFullscreen by rememberSaveable { mutableStateOf(false) }
@@ -536,7 +537,7 @@ fun VideoEditorWorkspace(
                 .weight(if (isToolDrawerExpanded) 0.45f else 0.62f)
                 .background(OledBlack)
         ) {
-            Box(
+            BoxWithConstraints(
                 modifier = Modifier
                     .fillMaxWidth()
                     .weight(1f)
@@ -547,27 +548,37 @@ fun VideoEditorWorkspace(
                         canvasSelection = CanvasSelectionTarget.NONE
                         isToolDrawerExpanded = false
                     }
-                    .padding(start = 20.dp, end = 20.dp, top = 24.dp, bottom = 10.dp),
+                    .padding(start = 24.dp, end = 24.dp, top = 36.dp, bottom = 14.dp),
                 contentAlignment = Alignment.Center
             ) {
-                val ratio = (state.aspectPreset.ratioW.toFloat() / state.aspectPreset.ratioH.toFloat())
-                    .coerceIn(0.56f, 2.25f)
-                // Unclipped aspect-ratio stage so white corner handles & top rotate handle are never cut off
-                BoxWithConstraints(
-                    modifier = Modifier
-                        .fillMaxHeight()
-                        .aspectRatio(ratio, matchHeightConstraintsFirst = true),
+                val targetRatio = state.aspectPreset.ratioW.toFloat() / state.aspectPreset.ratioH.toFloat()
+                val availW = maxWidth
+                val availH = maxHeight
+                val stageW = if (availH > 0.dp && (availW / availH) > targetRatio) {
+                    availH * targetRatio
+                } else {
+                    availW
+                }
+                val stageH = if (availH > 0.dp && (availW / availH) > targetRatio) {
+                    availH
+                } else {
+                    availW / targetRatio
+                }
+
+                // Exact aspect-ratio stage (matches previewBitmap dimensions 1:1 across 16:9, 9:16, 1:1, 4:5, 21:9)
+                Box(
+                    modifier = Modifier.size(width = stageW, height = stageH),
                     contentAlignment = Alignment.Center
                 ) {
-                    val canvasW = constraints.maxWidth.coerceAtLeast(1)
-                    val canvasH = constraints.maxHeight.coerceAtLeast(1)
+                    val canvasW = with(density) { stageW.roundToPx() }.coerceAtLeast(1)
+                    val canvasH = with(density) { stageH.roundToPx() }.coerceAtLeast(1)
                     val minCanvasEdge = minOf(canvasW, canvasH).coerceAtLeast(1).toFloat()
 
-                    // Clipped rounded video preview surface with unified tap-to-select & direct 2-finger pinch/rotate
+                    // Clipped rounded video preview surface with unified tap-to-select & pure pinch-zoom/pan (zero accidental rotation)
                     Box(
                         modifier = Modifier
                             .fillMaxSize()
-                            .clip(RoundedCornerShape(14.dp))
+                            .clip(RoundedCornerShape(12.dp))
                             .background(DeepObsidian)
                             .pointerInput(hasActiveUserPip) {
                                 detectTapGestures { tapOffset ->
@@ -620,14 +631,13 @@ fun VideoEditorWorkspace(
                                             }
                                         }
                                         else -> {
+                                            // Pure pinch-scale & pan on Video Frame — NO accidental rotation (rotation is exclusively via top circular rotate handle)
                                             val s = currentState
-                                            val baseRot = selectedClipRotDeg
-                                            val nextRot = if (rotation != 0f) normalizeAngleDeg(baseRot + rotation) else null
                                             viewModel.updateVideoCanvasTransform(
                                                 zoom = if (zoom != 1f) (s.cropZoom * zoom).coerceIn(0.25f, 3.0f) else null,
                                                 panX = if (pan.x != 0f) (s.panX + pan.x / (w * 0.4f)).coerceIn(-1f, 1f) else null,
                                                 panY = if (pan.y != 0f) (s.panY + pan.y / (h * 0.4f)).coerceIn(-1f, 1f) else null,
-                                                rotationDeg = nextRot
+                                                rotationDeg = null
                                             )
                                         }
                                     }
@@ -640,23 +650,37 @@ fun VideoEditorWorkspace(
                             Image(
                                 bitmap = previewBitmap.asImageBitmap(),
                                 contentDescription = "Video Preview",
-                                contentScale = ContentScale.Fit,
+                                contentScale = ContentScale.FillBounds,
                                 modifier = Modifier.fillMaxSize()
                             )
                         }
                     }
 
-                    // Pixel-Accurate Interactive White Bounding Box aligned directly to the video frame's outer edges
+                    // Pixel-Accurate Interactive White Bounding Box locked cleanly to the exact outer edges of the active video frame across all aspect ratios
                     if (canvasSelection == CanvasSelectionTarget.VIDEO) {
-                        val clipSrcW = activePlayheadClip?.sourceWidth?.takeIf { it > 0 }?.toFloat() ?: canvasW.toFloat()
-                        val clipSrcH = activePlayheadClip?.sourceHeight?.takeIf { it > 0 }?.toFloat() ?: canvasH.toFloat()
-                        val baseFit = minOf(canvasW.toFloat() / clipSrcW, canvasH.toFloat() / clipSrcH)
+                        val srcAspect = activePlayheadClip?.let { c ->
+                            if (c.sourceWidth > 0 && c.sourceHeight > 0) {
+                                c.sourceWidth.toFloat() / c.sourceHeight.toFloat()
+                            } else {
+                                liveSourceAspect
+                            }
+                        } ?: liveSourceAspect
+                        val safeSrcAspect = srcAspect.coerceIn(0.25f, 4.0f)
+                        val fitW: Float
+                        val fitH: Float
+                        if (canvasW.toFloat() / canvasH.toFloat() > safeSrcAspect) {
+                            fitH = canvasH.toFloat()
+                            fitW = fitH * safeSrcAspect
+                        } else {
+                            fitW = canvasW.toFloat()
+                            fitH = fitW / safeSrcAspect
+                        }
                         val stabilizeBoost = if (activePlayheadClip?.stabilizeEnabled == true) 1.09f else 1f
                         val effZoom = state.cropZoom.coerceIn(0.25f, 3.0f) * stabilizeBoost
-                        val rawFrameW = clipSrcW * baseFit * effZoom
-                        val rawFrameH = clipSrcH * baseFit * effZoom
-                        val boxW = rawFrameW.roundToInt().coerceIn(56, canvasW)
-                        val boxH = rawFrameH.roundToInt().coerceIn(56, canvasH)
+                        val rawFrameW = fitW * effZoom
+                        val rawFrameH = fitH * effZoom
+                        val boxW = rawFrameW.roundToInt().coerceIn(48, canvasW)
+                        val boxH = rawFrameH.roundToInt().coerceIn(48, canvasH)
                         val centerOffsetX = (state.panX * canvasW * 0.4f).roundToInt()
                         val centerOffsetY = (state.panY * canvasH * 0.4f).roundToInt()
                         val leftPx = ((canvasW - boxW) / 2 + centerOffsetX).coerceIn(0, (canvasW - boxW).coerceAtLeast(0))
@@ -677,15 +701,17 @@ fun VideoEditorWorkspace(
                                     panY = (s.panY + dyPx / (canvasH.toFloat() * 0.4f)).coerceIn(-1f, 1f)
                                 )
                             },
-                            onPinchRotate = { zoom, rotDeg ->
+                            onPinchRotate = { zoom, _ ->
+                                // Pure pinch scale without accidental rotation
                                 val s = currentState
-                                viewModel.updateVideoCanvasTransform(
-                                    zoom = if (zoom != 1f) (s.cropZoom * zoom).coerceIn(0.25f, 3.0f) else null,
-                                    rotationDeg = if (abs(rotDeg) > 0.05f) normalizeAngleDeg(selectedClipRotDeg + rotDeg) else null
-                                )
+                                if (zoom != 1f) {
+                                    viewModel.updateVideoCanvasTransform(
+                                        zoom = (s.cropZoom * zoom).coerceIn(0.25f, 3.0f)
+                                    )
+                                }
                             },
                             onCornerScaleDelta = { deltaNorm ->
-                                val nextZoom = (currentState.cropZoom + deltaNorm * 1.15f).coerceIn(0.25f, 3.0f)
+                                val nextZoom = (currentState.cropZoom + deltaNorm * 1.1f).coerceIn(0.25f, 3.0f)
                                 viewModel.updateVideoCanvasTransform(zoom = nextZoom)
                             },
                             onRotateDeltaDeg = { deltaDeg ->
@@ -697,7 +723,8 @@ fun VideoEditorWorkspace(
                                 canvasSelection = CanvasSelectionTarget.NONE
                             },
                             minCanvasEdge = minCanvasEdge,
-                            tagPrefix = "video_canvas"
+                            tagPrefix = "video_canvas",
+                            allowPinchRotate = false
                         )
                     }
 
@@ -2192,7 +2219,7 @@ fun VideoEditorWorkspace(
                                     selectedTransition = clip.transitionAfter,
                                     durationMs = clip.transitionDurationMs,
                                     onSelectTransition = { tr ->
-                                        viewModel.updateSelectedClip { it.copy(transitionAfter = tr) }
+                                        viewModel.selectClipTransition(tr)
                                     },
                                     onDurationChange = { durMs ->
                                         viewModel.updateSelectedClip { it.copy(transitionDurationMs = durMs) }
