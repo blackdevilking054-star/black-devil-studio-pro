@@ -7,6 +7,7 @@ import android.os.SystemClock
 import android.provider.OpenableColumns
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.BuildConfig
 import com.example.R
 import com.example.data.AuthResult
 import com.example.data.LocalEncryptedUserRepository
@@ -62,6 +63,9 @@ import com.example.model.VideoTextOverlay
 import com.example.model.VideoTransition
 import com.example.model.VoiceChangerPreset
 import com.example.security.AppSecurityFirewall
+import com.example.updater.AppUpdateChecker
+import com.example.updater.AppUpdateInfo
+import com.example.updater.UpdateCheckResult
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 import kotlinx.coroutines.Dispatchers
@@ -199,6 +203,13 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
     private val _videoSourceAspect = MutableStateFlow(16f / 9f)
     val videoSourceAspect: StateFlow<Float> = _videoSourceAspect.asStateFlow()
 
+    // GitHub Chrome OTA In-App Update State
+    private val _availableUpdate = MutableStateFlow<AppUpdateInfo?>(null)
+    val availableUpdate: StateFlow<AppUpdateInfo?> = _availableUpdate.asStateFlow()
+
+    private val _isCheckingUpdate = MutableStateFlow(false)
+    val isCheckingUpdate: StateFlow<Boolean> = _isCheckingUpdate.asStateFlow()
+
     private var videoRenderJob: Job? = null
     private var photoRenderJob: Job? = null
     private val videoRenderDirty = AtomicBoolean(false)
@@ -229,6 +240,55 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
         scheduleVideoPreviewRender()
         schedulePhotoPreviewRender()
         scheduleAutoSave(WorkspaceType.VIDEO)
+        checkForAppUpdate(manual = false)
+    }
+
+    // =========================================================================
+    // GITHUB CHROME OTA IN-APP UPDATE CHECKER
+    // =========================================================================
+
+    fun checkForAppUpdate(manual: Boolean = false) {
+        if (_isCheckingUpdate.value) return
+        _isCheckingUpdate.value = true
+        viewModelScope.launch {
+            try {
+                when (
+                    val result = AppUpdateChecker.checkForUpdate(
+                        currentVersionCode = BuildConfig.VERSION_CODE,
+                        currentVersionName = BuildConfig.VERSION_NAME
+                    )
+                ) {
+                    is UpdateCheckResult.UpdateAvailable -> {
+                        _availableUpdate.value = result.info
+                    }
+                    is UpdateCheckResult.UpToDate -> {
+                        if (manual) {
+                            showToast("You're on the latest version (v${result.currentVersionName})")
+                        }
+                    }
+                    is UpdateCheckResult.Failed -> {
+                        if (manual) {
+                            showToast(result.message)
+                        }
+                    }
+                }
+            } finally {
+                _isCheckingUpdate.value = false
+            }
+        }
+    }
+
+    fun dismissUpdateDialog() {
+        _availableUpdate.value = null
+    }
+
+    fun openAvailableUpdateInChrome() {
+        val update = _availableUpdate.value ?: return
+        val opened = AppUpdateChecker.openApkInChrome(appContext, update.apkUrl)
+        _availableUpdate.value = null
+        if (!opened) {
+            showToast("Unable to open Chrome for this update link.")
+        }
     }
 
     // =========================================================================

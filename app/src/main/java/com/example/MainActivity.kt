@@ -62,6 +62,7 @@ import com.example.model.StudioWorkspace
 import com.example.ui.auth.WelcomeAuthScreen
 import com.example.ui.components.AdminDashboardScreen
 import com.example.ui.components.AdminPinUnlockDialog
+import com.example.ui.components.AppUpdateDialog
 import com.example.ui.components.ProfileBottomSheet
 import com.example.ui.components.StudioTopBar
 import com.example.ui.theme.DeepObsidian
@@ -107,6 +108,7 @@ private fun XonixStudioApp(
     val exportProgress by viewModel.exportProgress.collectAsStateWithLifecycle()
     val toastMessage by viewModel.toastMessage.collectAsStateWithLifecycle()
     val autoSaveLabel by viewModel.autoSaveLabel.collectAsStateWithLifecycle()
+    val availableUpdate by viewModel.availableUpdate.collectAsStateWithLifecycle()
 
     val snackbarHostState = remember { SnackbarHostState() }
     var showProfileSheet by remember { mutableStateOf(false) }
@@ -142,6 +144,13 @@ private fun XonixStudioApp(
             onSignIn = { email, password -> viewModel.signIn(email, password) },
             onCreateAccount = { name, email, password -> viewModel.createAccount(name, email, password) }
         )
+        availableUpdate?.let { updateInfo ->
+            AppUpdateDialog(
+                updateInfo = updateInfo,
+                onDismiss = { viewModel.dismissUpdateDialog() },
+                onUpdateNow = { viewModel.openAvailableUpdateInChrome() }
+            )
+        }
         return
     }
 
@@ -339,10 +348,13 @@ private fun XonixStudioApp(
         // Profile Bottom Sheet (includes Owner-Only Admin Dashboard button strictly when isOwner == true)
         if (showProfileSheet) {
             val userLoginHistory by viewModel.currentUserLoginHistory.collectAsStateWithLifecycle()
+            val isCheckingUpdate by viewModel.isCheckingUpdate.collectAsStateWithLifecycle()
             ProfileBottomSheet(
                 user = activeUser,
                 isOwner = isOwner,
                 loginHistory = userLoginHistory,
+                isCheckingUpdate = isCheckingUpdate,
+                onCheckForUpdates = { viewModel.checkForAppUpdate(manual = true) },
                 onDismiss = { showProfileSheet = false },
                 onUpdateName = { newName -> viewModel.updateProfileName(newName) },
                 onShareApp = {
@@ -390,6 +402,15 @@ private fun XonixStudioApp(
                 loginHistory = allLoginHistory,
                 onRemoveUser = { userId -> viewModel.removeAccountAsOwner(userId) },
                 onClose = { viewModel.lockAdminDashboard() }
+            )
+        }
+
+        // GitHub Chrome OTA In-App Update Popup Dialog
+        availableUpdate?.let { updateInfo ->
+            AppUpdateDialog(
+                updateInfo = updateInfo,
+                onDismiss = { viewModel.dismissUpdateDialog() },
+                onUpdateNow = { viewModel.openAvailableUpdateInChrome() }
             )
         }
     }

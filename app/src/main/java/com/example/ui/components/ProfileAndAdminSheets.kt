@@ -35,10 +35,12 @@ import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.People
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Share
+import androidx.compose.material.icons.filled.SystemUpdate
 import androidx.compose.material.icons.filled.VerifiedUser
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -63,15 +65,19 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.BuildConfig
+import com.example.R
 import com.example.data.LoginHistoryEntity
 import com.example.data.UserAccountEntity
 import com.example.security.AppSecurityFirewall
+import com.example.updater.AppUpdateInfo
 import com.example.ui.theme.DeepObsidian
 import com.example.ui.theme.ElectricCyan
 import com.example.ui.theme.ElectricCyanContainer
@@ -98,6 +104,8 @@ fun ProfileBottomSheet(
     user: UserAccountEntity,
     isOwner: Boolean,
     loginHistory: List<LoginHistoryEntity>,
+    isCheckingUpdate: Boolean = false,
+    onCheckForUpdates: () -> Unit = {},
     onDismiss: () -> Unit,
     onUpdateName: (String) -> Unit,
     onShareApp: () -> Unit,
@@ -333,6 +341,71 @@ fun ProfileBottomSheet(
                 }
             }
 
+            // 3b. Check for Updates (GitHub Chrome OTA)
+            Surface(
+                onClick = { if (!isCheckingUpdate) onCheckForUpdates() },
+                shape = RoundedCornerShape(14.dp),
+                color = StudioSurfaceElevated,
+                border = BorderStroke(1.dp, ElectricCyan.copy(alpha = 0.55f)),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("profile_check_updates_button")
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(14.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.SystemUpdate,
+                            contentDescription = stringResource(R.string.update_check_title),
+                            tint = ElectricCyan,
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Spacer(Modifier.width(10.dp))
+                        Column {
+                            Text(
+                                text = stringResource(R.string.update_check_title),
+                                style = MaterialTheme.typography.titleSmall,
+                                color = TextPrimary
+                            )
+                            Text(
+                                text = "Installed v${BuildConfig.VERSION_NAME} (Build ${BuildConfig.VERSION_CODE})",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = TextSecondary
+                            )
+                        }
+                    }
+                    if (isCheckingUpdate) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(16.dp),
+                                strokeWidth = 2.dp,
+                                color = ElectricCyan
+                            )
+                            Spacer(Modifier.width(8.dp))
+                            Text(
+                                text = stringResource(R.string.update_checking),
+                                style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
+                                color = ElectricCyan
+                            )
+                        }
+                    } else {
+                        Text(
+                            text = stringResource(R.string.update_check_action),
+                            style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
+                            color = ElectricCyan
+                        )
+                    }
+                }
+            }
+
             // About Black Devil Studio Pro
             Surface(
                 shape = RoundedCornerShape(14.dp),
@@ -356,7 +429,7 @@ fun ProfileBottomSheet(
                             color = TextPrimary
                         )
                         Text(
-                            text = "v2.0 Pro • 4K Ready • Zero Watermarks • Offline Vault",
+                            text = "v${BuildConfig.VERSION_NAME} Pro • 4K Ready • Zero Watermarks • Offline Vault",
                             style = MaterialTheme.typography.labelSmall,
                             color = TextSecondary
                         )
@@ -786,4 +859,97 @@ private fun AdminStatCard(
             )
         }
     }
+}
+
+@Composable
+fun AppUpdateDialog(
+    updateInfo: AppUpdateInfo,
+    onDismiss: () -> Unit,
+    onUpdateNow: () -> Unit
+) {
+    val notesText = updateInfo.releaseNotes.ifBlank {
+        stringResource(R.string.update_dialog_default_notes)
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        modifier = Modifier.testTag("ota_update_dialog"),
+        containerColor = StudioSurface,
+        titleContentColor = TextPrimary,
+        textContentColor = TextSecondary,
+        icon = {
+            Icon(
+                imageVector = Icons.Default.SystemUpdate,
+                contentDescription = stringResource(R.string.update_dialog_title),
+                tint = ElectricCyan,
+                modifier = Modifier.size(28.dp)
+            )
+        },
+        title = {
+            Text(
+                text = stringResource(R.string.update_dialog_title),
+                style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.ExtraBold),
+                color = TextPrimary
+            )
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Surface(
+                    shape = RoundedCornerShape(10.dp),
+                    color = DeepObsidian,
+                    border = BorderStroke(1.dp, ElectricCyan.copy(alpha = 0.55f))
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "v${updateInfo.versionName} (Build ${updateInfo.versionCode})",
+                            style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold),
+                            color = ElectricCyan
+                        )
+                        Text(
+                            text = "Current v${BuildConfig.VERSION_NAME}",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = TextSecondary
+                        )
+                    }
+                }
+                Text(
+                    text = notesText,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = TextPrimary
+                )
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = onUpdateNow,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = ElectricCyan,
+                    contentColor = Color.White
+                ),
+                modifier = Modifier.testTag("ota_update_now_button")
+            ) {
+                Text(
+                    text = stringResource(R.string.update_dialog_now),
+                    fontWeight = FontWeight.Bold
+                )
+            }
+        },
+        dismissButton = {
+            TextButton(
+                onClick = onDismiss,
+                modifier = Modifier.testTag("ota_update_later_button")
+            ) {
+                Text(
+                    text = stringResource(R.string.update_dialog_later),
+                    color = TextSecondary
+                )
+            }
+        }
+    )
 }
