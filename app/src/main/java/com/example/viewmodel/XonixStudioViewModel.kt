@@ -22,6 +22,7 @@ import com.example.engine.AudioDspEngine
 import com.example.engine.ExportResult
 import com.example.engine.ImageProcessingEngine
 import com.example.engine.MediaExportStore
+import com.example.engine.StickerCatalogItem
 import com.example.engine.VideoMediaEngine
 import com.example.model.AudioEqPreset
 import com.example.model.AudioExportFormat
@@ -45,6 +46,7 @@ import com.example.model.PipOverlayState
 import com.example.model.SfxKind
 import com.example.model.SpeedCurvePreset
 import com.example.model.SpotHealPoint
+import com.example.model.StickerAnimationStyle
 import com.example.model.StudioShapeKind
 import com.example.model.StudioWorkspace
 import com.example.model.TextAnimationStyle
@@ -224,6 +226,7 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
     private var autoSaveJob: Job? = null
     private val recordingFlag = AtomicBoolean(false)
     private val videoVoiceRecordingFlag = AtomicBoolean(false)
+    private val starterAudioDismissed = AtomicBoolean(false)
 
     init {
         viewModelScope.launch(Dispatchers.IO) {
@@ -481,7 +484,7 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
             trimStartMs = 0L,
             trimEndMs = 3500L,
             speed = 1.25f,
-            transitionAfter = VideoTransition.FLASH
+            transitionAfter = VideoTransition.NONE
         )
         val titleOverlay = VideoTextOverlay(
             id = "txt_title_1",
@@ -711,11 +714,51 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
     }
 
     fun selectClip(id: String) {
-        _videoState.update { it.copy(selectedClipId = id, selectedAudioClipId = null) }
+        _videoState.update { it.copy(selectedClipId = id, selectedAudioClipId = null, selectedTextId = null) }
     }
 
     fun clearTimelineSelection() {
-        _videoState.update { it.copy(selectedClipId = null, selectedAudioClipId = null) }
+        _videoState.update { it.copy(selectedClipId = null, selectedAudioClipId = null, selectedTextId = null) }
+    }
+
+    fun trimVideoClipByHandle(
+        clipId: String,
+        newTrimStartMs: Long? = null,
+        newTrimEndMs: Long? = null
+    ) {
+        recordVideoUndoSnapshot(coalesceTag = "video_trim_$clipId")
+        _videoState.update { s ->
+            val updatedClips = s.clips.map { c ->
+                if (c.id != clipId) c else {
+                    val isExtendableStatic = c.uriString.isNullOrBlank()
+                    val maxAllowedEnd = if (isExtendableStatic) 30_000L else c.durationMs.coerceAtLeast(300L)
+                    val curStart = c.trimStartMs.coerceAtLeast(0L)
+                    val curEnd = c.trimEndMs.coerceAtLeast(curStart + 300L)
+                    val nextStart = if (newTrimStartMs != null) {
+                        newTrimStartMs.coerceIn(0L, (curEnd - 300L).coerceAtLeast(0L))
+                    } else curStart
+                    val nextEnd = if (newTrimEndMs != null) {
+                        newTrimEndMs.coerceIn((nextStart + 300L).coerceAtMost(maxAllowedEnd), maxAllowedEnd)
+                    } else curEnd
+                    val nextDuration = if (isExtendableStatic) maxOf(c.durationMs, nextEnd) else c.durationMs
+                    c.copy(
+                        durationMs = nextDuration,
+                        trimStartMs = nextStart,
+                        trimEndMs = nextEnd
+                    )
+                }
+            }
+            val nextTotal = updatedClips.sumOf { it.effectiveDurationMs }
+            s.copy(
+                selectedClipId = clipId,
+                selectedAudioClipId = null,
+                selectedTextId = null,
+                clips = updatedClips,
+                playheadMs = s.playheadMs.coerceAtMost(nextTotal)
+            )
+        }
+        scheduleVideoPreviewRender()
+        scheduleAutoSave(WorkspaceType.VIDEO)
     }
 
     fun reorderClip(id: String, moveLeft: Boolean) {
@@ -728,7 +771,7 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
             val mutable = s.clips.toMutableList()
             val item = mutable.removeAt(idx)
             mutable.add(target, item)
-            s.copy(clips = mutable)
+            s.copy(clips = mutable, selectedClipId = id)
         }
         scheduleVideoPreviewRender()
         scheduleAutoSave(WorkspaceType.VIDEO)
@@ -882,22 +925,49 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
     }
 
     fun deleteSelectedClip() {
-        if (_videoState.value.clips.size <= 1) {
-            showToast("At least one clip must remain in timeline")
+        val current = _videoState.value
+        if (current.clips.isEmpty()) {
+            showToast("No video clips to delete")
             return
         }
+        val targetId = current.selectedClipId
+            ?: findClipAtPlayhead(current)?.second?.id
+            ?: current.clips.firstOrNull()?.id
+            ?: return
+        deleteVideoClipById(targetId)
+    }
+
+    fun deleteVideoClipById(clipId: String) {
+        if (_videoState.value.clips.none { it.id == clipId }) return
         recordVideoUndoSnapshot()
         _videoState.update { s ->
-            val remaining = s.clips.filterNot { it.id == s.selectedClipId }
-            s.copy(
-                clips = remaining,
-                selectedClipId = remaining.firstOrNull()?.id,
-                playheadMs = s.playheadMs.coerceAtMost(remaining.sumOf { it.effectiveDurationMs })
-            )
+            val remaining = s.clips.filterNot { it.id == clipId }
+            val nextTotal = remaining.sumOf { it.effectiveDurationMs }
+            if (remaining.isEmpty()) {
+                s.copy(
+                    clips = emptyList(),
+                    selectedClipId = null,
+                    playheadMs = 0L,
+                    isPlaying = false,
+                    cropZoom = 1f,
+                    panX = 0f,
+                    panY = 0f
+                )
+            } else {
+                s.copy(
+                    clips = remaining,
+                    selectedClipId = remaining.firstOrNull()?.id,
+                    playheadMs = s.playheadMs.coerceAtMost(nextTotal)
+                )
+            }
+        }
+        if (_videoState.value.clips.isEmpty()) {
+            stopVideoPlayback()
         }
         refreshFilmstripThumbnails(_videoState.value.clips)
-        scheduleVideoPreviewRender()
+        scheduleVideoPreviewRender(true)
         scheduleAutoSave(WorkspaceType.VIDEO)
+        showToast("Clip removed")
     }
 
     fun updateSelectedClip(transform: (VideoClip) -> VideoClip) {
@@ -1102,7 +1172,7 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
     }
 
     fun selectVideoAudioClip(id: String) {
-        _videoState.update { it.copy(selectedAudioClipId = id, selectedClipId = null) }
+        _videoState.update { it.copy(selectedAudioClipId = id, selectedClipId = null, selectedTextId = null) }
     }
 
     fun updateSelectedVideoAudioClip(transform: (VideoAudioClip) -> VideoAudioClip) {
@@ -1117,22 +1187,26 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
         id: String,
         trimStartPct: Float? = null,
         trimEndPct: Float? = null,
-        startMs: Long? = null
+        startMs: Long? = null,
+        durationMs: Long? = null
     ) {
         recordVideoUndoSnapshot(coalesceTag = "audio_trim_$id")
         _videoState.update { s ->
-            val maxStart = s.totalDurationMs.coerceAtLeast(0L)
+            val maxStart = maxOf(s.totalDurationMs, 15_000L)
             s.copy(
                 selectedAudioClipId = id,
                 selectedClipId = null,
+                selectedTextId = null,
                 audioLaneClips = s.audioLaneClips.map { a ->
                     if (a.id != id) a else {
+                        val nextDur = (durationMs ?: a.durationMs).coerceIn(400L, 60_000L)
                         val nextStartPct = (trimStartPct ?: a.trimStartPct)
-                            .coerceIn(0f, (a.trimEndPct - 0.06f).coerceAtLeast(0f))
+                            .coerceIn(0f, (a.trimEndPct - 0.05f).coerceAtLeast(0f))
                         val nextEndPct = (trimEndPct ?: a.trimEndPct)
-                            .coerceIn((nextStartPct + 0.06f).coerceAtMost(1f), 1f)
+                            .coerceIn((nextStartPct + 0.05f).coerceAtMost(1f), 1f)
                         val nextStartMs = (startMs ?: a.startMs).coerceIn(0L, maxStart)
                         a.copy(
+                            durationMs = nextDur,
                             trimStartPct = nextStartPct,
                             trimEndPct = nextEndPct,
                             startMs = nextStartMs
@@ -1169,10 +1243,11 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
     fun moveVideoAudioClip(id: String, newStartMs: Long) {
         recordVideoUndoSnapshot(coalesceTag = "audio_drag_$id")
         _videoState.update { s ->
-            val maxStart = s.totalDurationMs.coerceAtLeast(0L)
+            val maxStart = maxOf(s.totalDurationMs, 15_000L)
             s.copy(
                 selectedAudioClipId = id,
                 selectedClipId = null,
+                selectedTextId = null,
                 audioLaneClips = s.audioLaneClips.map { a ->
                     if (a.id == id) a.copy(startMs = newStartMs.coerceIn(0L, maxStart)) else a
                 }
@@ -1182,13 +1257,19 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
     }
 
     fun deleteSelectedVideoAudioClip() {
+        val targetId = _videoState.value.selectedAudioClip?.id ?: return
+        deleteVideoAudioClip(targetId)
+    }
+
+    fun deleteVideoAudioClip(id: String) {
+        if (_videoState.value.audioLaneClips.none { it.id == id }) return
+        starterAudioDismissed.set(true)
         recordVideoUndoSnapshot()
         _videoState.update { s ->
-            val id = s.selectedAudioClip?.id ?: return@update s
             val rem = s.audioLaneClips.filterNot { it.id == id }
             s.copy(audioLaneClips = rem, selectedAudioClipId = rem.lastOrNull()?.id)
         }
-        showToast("Audio clip removed")
+        showToast("Audio track removed")
         scheduleAutoSave(WorkspaceType.VIDEO)
     }
 
@@ -1295,28 +1376,110 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
     }
 
     fun addVideoSticker(symbol: String) {
+        recordVideoUndoSnapshot()
         val now = _videoState.value.playheadMs
         val total = _videoState.value.totalDurationMs
         val layer = VideoTextOverlay(
             id = "vstk_${UUID.randomUUID().toString().take(8)}",
             text = symbol,
-            fontId = "bangers",
+            fontId = "impact_display",
             colorArgb = 0xFFFFFFFF.toInt(),
             strokeArgb = 0xFF000000.toInt(),
             strokeWidth = 4f,
             bgEnabled = false,
             xNorm = 0.5f,
             yNorm = 0.45f,
-            scale = 1.6f,
+            scale = 1.25f,
             startMs = now,
-            endMs = (now + 3500L).coerceAtMost(total),
-            animation = TextAnimationStyle.POP,
-            isSticker = true
+            endMs = if (total > 0L) (now + 3500L).coerceAtMost(total).coerceAtLeast(now + 400L) else now + 3500L,
+            animation = TextAnimationStyle.NONE,
+            isSticker = true,
+            stickerAnimation = StickerAnimationStyle.POP
         )
-        _videoState.update { it.copy(textLayers = it.textLayers + layer, selectedTextId = layer.id) }
+        _videoState.update {
+            it.copy(
+                textLayers = it.textLayers + layer,
+                selectedTextId = layer.id,
+                selectedClipId = null,
+                selectedAudioClipId = null
+            )
+        }
         scheduleVideoPreviewRender(true)
         scheduleAutoSave(WorkspaceType.VIDEO)
         showToast("Sticker added")
+    }
+
+    fun addCatalogSticker(item: StickerCatalogItem) {
+        recordVideoUndoSnapshot()
+        val now = _videoState.value.playheadMs
+        val total = _videoState.value.totalDurationMs
+        val layer = VideoTextOverlay(
+            id = "vstk_${UUID.randomUUID().toString().take(8)}",
+            text = if (item.badgeId == null) item.previewGlyph else item.label,
+            fontId = "impact_display",
+            colorArgb = item.primaryColorArgb,
+            strokeArgb = item.secondaryColorArgb,
+            strokeWidth = 4f,
+            bgEnabled = false,
+            xNorm = 0.5f,
+            yNorm = 0.45f,
+            scale = if (item.badgeId?.startsWith("frame_") == true) 1.35f else 1.15f,
+            startMs = now,
+            endMs = if (total > 0L) (now + 3500L).coerceAtMost(total).coerceAtLeast(now + 400L) else now + 3500L,
+            animation = TextAnimationStyle.NONE,
+            isSticker = true,
+            stickerBadgeId = item.badgeId,
+            stickerAnimation = StickerAnimationStyle.POP
+        )
+        _videoState.update {
+            it.copy(
+                textLayers = it.textLayers + layer,
+                selectedTextId = layer.id,
+                selectedClipId = null,
+                selectedAudioClipId = null
+            )
+        }
+        scheduleVideoPreviewRender(true)
+        scheduleAutoSave(WorkspaceType.VIDEO)
+        showToast("Added ${item.label} sticker")
+    }
+
+    fun importCustomImageSticker(uri: Uri) {
+        if (!AppSecurityFirewall.validateMediaUri(appContext, uri, "image/")) {
+            showToast("Selected file is not a supported image")
+            return
+        }
+        recordVideoUndoSnapshot()
+        val cleanName = AppSecurityFirewall.sanitizeText(
+            queryFileName(uri) ?: "Photo Sticker",
+            maxLength = 32
+        ).substringBeforeLast(".")
+        val now = _videoState.value.playheadMs
+        val total = _videoState.value.totalDurationMs
+        val layer = VideoTextOverlay(
+            id = "vstk_${UUID.randomUUID().toString().take(8)}",
+            text = cleanName.ifBlank { "Photo Sticker" },
+            xNorm = 0.5f,
+            yNorm = 0.45f,
+            scale = 1.0f,
+            startMs = now,
+            endMs = if (total > 0L) (now + 4000L).coerceAtMost(total).coerceAtLeast(now + 400L) else now + 4000L,
+            animation = TextAnimationStyle.NONE,
+            isSticker = true,
+            stickerImageUri = uri.toString(),
+            stickerAnimation = StickerAnimationStyle.POP
+        )
+        _videoState.update {
+            it.copy(
+                textLayers = it.textLayers + layer,
+                selectedTextId = layer.id,
+                selectedClipId = null,
+                selectedAudioClipId = null
+            )
+        }
+        scheduleVideoPreviewRender(true)
+        scheduleAutoSave(WorkspaceType.VIDEO)
+        showToast("Custom sticker imported")
     }
 
     fun seekPlayhead(ms: Long) {
@@ -1374,6 +1537,10 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
         if (_videoState.value.isPlaying) {
             stopVideoPlayback()
         } else {
+            if (_videoState.value.clips.isEmpty()) {
+                showToast("Add a video clip to play")
+                return
+            }
             _videoState.update { it.copy(isPlaying = true) }
             playbackJob?.cancel()
             playbackJob = viewModelScope.launch {
@@ -1547,45 +1714,164 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
         val layer = VideoTextOverlay(
             id = "vtxt_${UUID.randomUUID().toString().take(8)}",
             text = cleanText,
-            fontId = if (isCaption) "space_grotesk" else "anton",
-            colorArgb = if (isCaption) 0xFFFFFFFF.toInt() else 0xFF00E5FF.toInt(),
+            fontId = if (isCaption) "bold_sans" else "impact_display",
+            colorArgb = if (isCaption) 0xFFFFFFFF.toInt() else 0xFFFF1E42.toInt(),
             strokeArgb = 0xFF000000.toInt(),
-            strokeWidth = if (isCaption) 4f else 7f,
+            strokeWidth = if (isCaption) 4f else 6f,
             xNorm = 0.5f,
-            yNorm = if (isCaption) 0.88f else 0.25f,
+            yNorm = if (isCaption) 0.86f else 0.30f,
             scale = if (isCaption) 0.85f else 1.05f,
             startMs = now,
-            endMs = (now + 3500L).coerceAtMost(total),
+            endMs = if (total > 0L) (now + 3500L).coerceAtMost(total).coerceAtLeast(now + 400L) else now + 3500L,
             animation = if (isCaption) TextAnimationStyle.FADE else TextAnimationStyle.POP,
             isCaption = isCaption
         )
-        _videoState.update { it.copy(textLayers = it.textLayers + layer, selectedTextId = layer.id) }
+        _videoState.update {
+            it.copy(
+                textLayers = it.textLayers + layer,
+                selectedTextId = layer.id,
+                selectedClipId = null,
+                selectedAudioClipId = null
+            )
+        }
         scheduleVideoPreviewRender(true)
         scheduleAutoSave(WorkspaceType.VIDEO)
     }
 
     fun selectVideoText(id: String) {
-        _videoState.update { it.copy(selectedTextId = id) }
+        _videoState.update { it.copy(selectedTextId = id, selectedClipId = null, selectedAudioClipId = null) }
     }
 
     fun updateSelectedVideoText(transform: (VideoTextOverlay) -> VideoTextOverlay) {
         recordVideoUndoSnapshot(coalesceTag = "text_edit")
         _videoState.update { s ->
-            val id = s.selectedTextId ?: return@update s
-            s.copy(textLayers = s.textLayers.map { if (it.id == id) transform(it) else it })
+            val id = s.selectedTextId ?: s.textLayers.firstOrNull()?.id ?: return@update s
+            s.copy(
+                selectedTextId = id,
+                textLayers = s.textLayers.map { if (it.id == id) transform(it) else it }
+            )
         }
         scheduleVideoPreviewRender()
         scheduleAutoSave(WorkspaceType.VIDEO)
     }
 
-    fun deleteSelectedVideoText() {
+    fun duplicateVideoText(id: String) {
+        val target = _videoState.value.textLayers.firstOrNull { it.id == id } ?: return
         recordVideoUndoSnapshot()
-        _videoState.update { s ->
-            val id = s.selectedTextId ?: return@update s
-            val rem = s.textLayers.filterNot { it.id == id }
-            s.copy(textLayers = rem, selectedTextId = rem.lastOrNull()?.id)
+        val prefix = if (target.isSticker) "vstk" else "vtxt"
+        val copy = target.copy(
+            id = "${prefix}_${UUID.randomUUID().toString().take(8)}",
+            xNorm = (target.xNorm + 0.05f).coerceIn(0.10f, 0.90f),
+            yNorm = (target.yNorm + 0.05f).coerceIn(0.10f, 0.90f)
+        )
+        _videoState.update {
+            it.copy(
+                textLayers = it.textLayers + copy,
+                selectedTextId = copy.id,
+                selectedClipId = null,
+                selectedAudioClipId = null
+            )
         }
         scheduleVideoPreviewRender(true)
+        scheduleAutoSave(WorkspaceType.VIDEO)
+        showToast(if (target.isSticker) "Sticker duplicated" else "Text duplicated")
+    }
+
+    fun moveVideoTextOverlay(id: String, newStartMs: Long) {
+        recordVideoUndoSnapshot(coalesceTag = "text_move_$id")
+        _videoState.update { s ->
+            val maxStart = maxOf(s.totalDurationMs, 20_000L)
+            s.copy(
+                selectedTextId = id,
+                selectedClipId = null,
+                selectedAudioClipId = null,
+                textLayers = s.textLayers.map { layer ->
+                    if (layer.id != id) layer else {
+                        val dur = (layer.endMs - layer.startMs).coerceAtLeast(300L)
+                        val clampedStart = newStartMs.coerceIn(0L, maxStart)
+                        layer.copy(startMs = clampedStart, endMs = clampedStart + dur)
+                    }
+                }
+            )
+        }
+        scheduleVideoPreviewRender()
+        scheduleAutoSave(WorkspaceType.VIDEO)
+    }
+
+    fun trimVideoTextOverlay(
+        id: String,
+        newStartMs: Long? = null,
+        newEndMs: Long? = null
+    ) {
+        recordVideoUndoSnapshot(coalesceTag = "text_trim_$id")
+        _videoState.update { s ->
+            val maxEnd = maxOf(s.totalDurationMs, 30_000L)
+            s.copy(
+                selectedTextId = id,
+                selectedClipId = null,
+                selectedAudioClipId = null,
+                textLayers = s.textLayers.map { layer ->
+                    if (layer.id != id) layer else {
+                        val nextStart = if (newStartMs != null) {
+                            newStartMs.coerceIn(0L, (layer.endMs - 300L).coerceAtLeast(0L))
+                        } else layer.startMs
+                        val nextEnd = if (newEndMs != null) {
+                            newEndMs.coerceIn((nextStart + 300L).coerceAtMost(maxEnd), maxEnd)
+                        } else layer.endMs
+                        layer.copy(startMs = nextStart, endMs = nextEnd.coerceAtLeast(nextStart + 300L))
+                    }
+                }
+            )
+        }
+        scheduleVideoPreviewRender()
+        scheduleAutoSave(WorkspaceType.VIDEO)
+    }
+
+    fun updateStickerCrop(
+        id: String,
+        left: Float,
+        top: Float,
+        right: Float,
+        bottom: Float
+    ) {
+        recordVideoUndoSnapshot()
+        val l = left.coerceIn(0f, 0.85f)
+        val t = top.coerceIn(0f, 0.85f)
+        val r = right.coerceIn((l + 0.15f).coerceAtMost(1f), 1f)
+        val b = bottom.coerceIn((t + 0.15f).coerceAtMost(1f), 1f)
+        _videoState.update { s ->
+            s.copy(
+                textLayers = s.textLayers.map { layer ->
+                    if (layer.id == id) {
+                        layer.copy(cropLeft = l, cropTop = t, cropRight = r, cropBottom = b)
+                    } else layer
+                }
+            )
+        }
+        scheduleVideoPreviewRender(true)
+        scheduleAutoSave(WorkspaceType.VIDEO)
+        showToast("Sticker cropped")
+    }
+
+    fun deleteSelectedVideoText() {
+        val current = _videoState.value
+        val targetId = current.selectedTextId ?: current.textLayers.lastOrNull()?.id ?: return
+        deleteVideoText(targetId)
+    }
+
+    fun deleteVideoText(id: String) {
+        val target = _videoState.value.textLayers.firstOrNull { it.id == id } ?: return
+        recordVideoUndoSnapshot()
+        _videoState.update { s ->
+            val rem = s.textLayers.filterNot { it.id == id }
+            s.copy(
+                textLayers = rem,
+                selectedTextId = if (s.selectedTextId == id) null else s.selectedTextId
+            )
+        }
+        scheduleVideoPreviewRender(true)
+        scheduleAutoSave(WorkspaceType.VIDEO)
+        showToast(if (target.isSticker) "Sticker removed" else "Text layer removed")
     }
 
     fun setListeningCaptions(listening: Boolean) {
@@ -2298,7 +2584,7 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
                 })
             }
 
-            if (_videoState.value.audioLaneClips.isEmpty()) {
+            if (!starterAudioDismissed.get() && _videoState.value.audioLaneClips.isEmpty()) {
                 val starterLaneClip = VideoAudioClip(
                     id = "vaud_starter_beat",
                     name = "Crimson Synth Beat",
@@ -2308,7 +2594,7 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
                     volume = 0.85f
                 )
                 _videoState.update { s ->
-                    if (s.audioLaneClips.isEmpty()) {
+                    if (!starterAudioDismissed.get() && s.audioLaneClips.isEmpty()) {
                         s.copy(audioLaneClips = listOf(starterLaneClip), selectedAudioClipId = starterLaneClip.id)
                     } else s
                 }
@@ -2822,6 +3108,7 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
                         } else {
                             restored.pip.copy(fallbackDrawable = null)
                         }
+                        starterAudioDismissed.set(true)
                         _videoState.value = restored.copy(
                             isPlaying = false,
                             isListeningCaptions = false,

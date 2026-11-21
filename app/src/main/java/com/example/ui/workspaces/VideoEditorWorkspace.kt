@@ -116,6 +116,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
@@ -133,7 +134,9 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.zIndex
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.example.engine.ImageProcessingEngine
 import com.example.engine.VideoMediaEngine
+import com.example.engine.VideoOverlayRenderer
 import com.example.model.BlendModeKind
 import com.example.model.FilterCategory
 import com.example.model.HardwareEncoderCapabilities
@@ -183,7 +186,7 @@ import kotlin.math.roundToInt
 import kotlin.math.sin
 
 private enum class VideoToolTab {
-    NONE, TRIM, SPLIT, AUDIO, TEXT, FILTER, TRANSITIONS, SPEED, KEYFRAME, DELETE, ADJUST, ENHANCE, FRAME, OVERLAY, EXPORT
+    NONE, TRIM, SPLIT, AUDIO, TEXT, STICKER, FILTER, TRANSITIONS, SPEED, KEYFRAME, DELETE, ADJUST, ENHANCE, FRAME, OVERLAY, EXPORT
 }
 
 private enum class VideoTrimControl(val label: String) {
@@ -246,7 +249,7 @@ private enum class VideoTextControl(val label: String) {
 }
 
 private enum class CanvasSelectionTarget {
-    NONE, VIDEO, PIP
+    NONE, VIDEO, PIP, TEXT, STICKER
 }
 
 @Composable
@@ -282,6 +285,7 @@ fun VideoEditorWorkspace(
     var keyframeControl by rememberSaveable { mutableStateOf(VideoKeyframeControl.SCALE) }
     var textControl by rememberSaveable { mutableStateOf(VideoTextControl.FONT) }
     var showStickerRow by rememberSaveable { mutableStateOf(false) }
+    var isStickerCropping by rememberSaveable { mutableStateOf(false) }
 
     LaunchedEffect(openEnhanceRequested) {
         if (openEnhanceRequested) {
@@ -323,6 +327,17 @@ fun VideoEditorWorkspace(
         if (uri != null) viewModel.setVideoBgImage(uri)
     }
 
+    val stickerImagePicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.PickVisualMedia()
+    ) { uri ->
+        if (uri != null) {
+            viewModel.importCustomImageSticker(uri)
+            canvasSelection = CanvasSelectionTarget.STICKER
+            activeTab = VideoToolTab.STICKER
+            isToolDrawerExpanded = true
+        }
+    }
+
     val audioLanePicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri ->
@@ -358,6 +373,7 @@ fun VideoEditorWorkspace(
             ToolTabItem(VideoToolTab.SPLIT, "Split", Icons.Default.ContentCut),
             ToolTabItem(VideoToolTab.AUDIO, "Audio", Icons.Default.MusicNote),
             ToolTabItem(VideoToolTab.TEXT, "Text", Icons.Default.Title),
+            ToolTabItem(VideoToolTab.STICKER, "Sticker", Icons.Default.Photo),
             ToolTabItem(VideoToolTab.FILTER, "Filter", Icons.Default.FilterVintage),
             ToolTabItem(VideoToolTab.TRANSITIONS, "FX", Icons.Default.AutoAwesome),
             ToolTabItem(VideoToolTab.SPEED, "Speed", Icons.Default.Speed),
@@ -499,27 +515,63 @@ fun VideoEditorWorkspace(
 
     val currentState by rememberUpdatedState(state)
     val currentCanvasSelection by rememberUpdatedState(canvasSelection)
-    val activePlayheadClip = remember(state.clips, state.playheadMs) {
+    val activePlayheadInfo = remember(state.clips, state.playheadMs) {
         var acc = 0L
-        state.clips.firstOrNull { clip ->
-            val end = acc + clip.effectiveDurationMs
-            val inside = state.playheadMs <= end
-            acc = end
-            inside
-        } ?: state.clips.lastOrNull()
+        var found: Pair<com.example.model.VideoClip, Long>? = null
+        for (i in state.clips.indices) {
+            val clip = state.clips[i]
+            val dur = clip.effectiveDurationMs
+            if (state.playheadMs <= acc + dur || i == state.clips.lastIndex) {
+                found = clip to (state.playheadMs - acc).coerceIn(0L, dur)
+                break
+            }
+            acc += dur
+        }
+        found
     }
-    val selectedClipRotDeg = activePlayheadClip?.rotationDeg ?: state.selectedClip?.rotationDeg ?: 0f
+    val activePlayheadClip = activePlayheadInfo?.first
+    val activePlayheadLocalMs = activePlayheadInfo?.second ?: 0L
+    val activeKeyframeInterp = remember(activePlayheadClip?.keyframes, activePlayheadLocalMs) {
+        val kfs = activePlayheadClip?.keyframes.orEmpty()
+        VideoMediaEngine.interpolateKeyframes(kfs, activePlayheadLocalMs)
+    }
+    val selectedClipRotDeg = (activePlayheadClip?.rotationDeg ?: state.selectedClip?.rotationDeg ?: 0f) + activeKeyframeInterp.rotationDeg
+
+    val selectedOverlayLayer = remember(state.textLayers, state.selectedTextId) {
+        state.textLayers.firstOrNull { it.id == state.selectedTextId }
+    }
 
     val clearSelectionAndCloseDrawer: () -> Unit = {
         viewModel.clearTimelineSelection()
         isClipQuickBarVisible = false
         isToolDrawerExpanded = false
+        isStickerCropping = false
         canvasSelection = CanvasSelectionTarget.NONE
     }
 
     LaunchedEffect(hasActiveUserPip) {
         if (!hasActiveUserPip && canvasSelection == CanvasSelectionTarget.PIP) {
             canvasSelection = CanvasSelectionTarget.NONE
+        }
+    }
+
+    LaunchedEffect(selectedOverlayLayer?.id, selectedOverlayLayer?.isSticker) {
+        if (selectedOverlayLayer == null) {
+            isStickerCropping = false
+            if (canvasSelection == CanvasSelectionTarget.TEXT || canvasSelection == CanvasSelectionTarget.STICKER) {
+                canvasSelection = CanvasSelectionTarget.NONE
+            }
+        } else if (!selectedOverlayLayer.isSticker) {
+            isStickerCropping = false
+        }
+    }
+
+    LaunchedEffect(state.clips.isEmpty()) {
+        if (state.clips.isEmpty()) {
+            if (canvasSelection == CanvasSelectionTarget.VIDEO) {
+                canvasSelection = CanvasSelectionTarget.NONE
+            }
+            isClipQuickBarVisible = false
         }
     }
 
@@ -566,30 +618,62 @@ fun VideoEditorWorkspace(
                 }
 
                 // Exact aspect-ratio stage (matches previewBitmap dimensions 1:1 across 16:9, 9:16, 1:1, 4:5, 21:9)
+                // Clipped cleanly to viewport bounds so resize box & handles never overflow the player container
                 Box(
-                    modifier = Modifier.size(width = stageW, height = stageH),
+                    modifier = Modifier
+                        .size(width = stageW, height = stageH)
+                        .clip(RoundedCornerShape(12.dp))
+                        .clipToBounds()
+                        .background(Color.Black),
                     contentAlignment = Alignment.Center
                 ) {
                     val canvasW = with(density) { stageW.roundToPx() }.coerceAtLeast(1)
                     val canvasH = with(density) { stageH.roundToPx() }.coerceAtLeast(1)
                     val minCanvasEdge = minOf(canvasW, canvasH).coerceAtLeast(1).toFloat()
 
-                    // Clipped rounded video preview surface with unified tap-to-select & pure pinch-zoom/pan (zero accidental rotation)
+                    // Clipped rounded pure-black video preview surface with top-to-bottom hit-testing (Stickers -> Text -> PIP -> Video)
                     Box(
                         modifier = Modifier
                             .fillMaxSize()
-                            .clip(RoundedCornerShape(12.dp))
-                            .background(DeepObsidian)
-                            .pointerInput(hasActiveUserPip) {
+                            .background(Color.Black)
+                            .pointerInput(hasActiveUserPip, state.clips.isNotEmpty(), state.textLayers.size) {
                                 detectTapGestures { tapOffset ->
+                                    if (isStickerCropping) return@detectTapGestures
                                     val w = size.width.coerceAtLeast(1).toFloat()
                                     val h = size.height.coerceAtLeast(1).toFloat()
-                                    val pip = currentState.pip
+                                    val curState = currentState
+
+                                    // 1. Hit-test active Stickers & Text overlays first (topmost layers)
+                                    val visibleOverlays = curState.textLayers
+                                        .filter { curState.playheadMs in it.startMs..it.endMs }
+                                        .asReversed()
+                                    for (layer in visibleOverlays) {
+                                        val b = VideoOverlayRenderer.measureOverlayBounds(context, layer, w, h)
+                                        val pad = 16f
+                                        val hit = tapOffset.x in (b.cx - b.width / 2f - pad)..(b.cx + b.width / 2f + pad) &&
+                                            tapOffset.y in (b.cy - b.height / 2f - pad)..(b.cy + b.height / 2f + pad)
+                                        if (hit) {
+                                            viewModel.selectVideoText(layer.id)
+                                            isClipQuickBarVisible = false
+                                            if (layer.isSticker) {
+                                                canvasSelection = CanvasSelectionTarget.STICKER
+                                                activeTab = VideoToolTab.STICKER
+                                            } else {
+                                                canvasSelection = CanvasSelectionTarget.TEXT
+                                                activeTab = VideoToolTab.TEXT
+                                            }
+                                            isToolDrawerExpanded = true
+                                            return@detectTapGestures
+                                        }
+                                    }
+
+                                    // 2. Hit-test user PIP overlay
+                                    val pip = curState.pip
                                     if (hasActiveUserPip) {
                                         val pipW = (w * pip.scale).coerceIn(88f, w)
                                         val pipH = (h * pip.scale).coerceIn(72f, h)
-                                        val cx = w * pip.xNorm
-                                        val cy = h * pip.yNorm
+                                        val cx = ImageProcessingEngine.clampFrameCenter(w * pip.xNorm, pipW, w)
+                                        val cy = ImageProcessingEngine.clampFrameCenter(h * pip.yNorm, pipH, h)
                                         val hitPip = tapOffset.x in (cx - pipW / 2f)..(cx + pipW / 2f) &&
                                             tapOffset.y in (cy - pipH / 2f)..(cy + pipH / 2f)
                                         if (hitPip) {
@@ -601,6 +685,12 @@ fun VideoEditorWorkspace(
                                             return@detectTapGestures
                                         }
                                     }
+
+                                    // 3. Fallback to Video Frame selection
+                                    if (curState.clips.isEmpty()) {
+                                        canvasSelection = CanvasSelectionTarget.NONE
+                                        return@detectTapGestures
+                                    }
                                     canvasSelection = if (currentCanvasSelection == CanvasSelectionTarget.VIDEO) {
                                         CanvasSelectionTarget.NONE
                                     } else {
@@ -610,15 +700,27 @@ fun VideoEditorWorkspace(
                             }
                             .pointerInput("video_canvas_multitouch") {
                                 detectTransformGestures { _, pan, zoom, rotation ->
+                                    if (isStickerCropping) return@detectTransformGestures
                                     if (zoom == 1f && rotation == 0f && currentCanvasSelection == CanvasSelectionTarget.NONE) {
                                         return@detectTransformGestures
                                     }
                                     val w = size.width.coerceAtLeast(1).toFloat()
                                     val h = size.height.coerceAtLeast(1).toFloat()
-                                    if (currentCanvasSelection == CanvasSelectionTarget.NONE) {
+                                    if (currentCanvasSelection == CanvasSelectionTarget.NONE && currentState.clips.isNotEmpty()) {
                                         canvasSelection = CanvasSelectionTarget.VIDEO
                                     }
                                     when (currentCanvasSelection) {
+                                        CanvasSelectionTarget.TEXT,
+                                        CanvasSelectionTarget.STICKER -> {
+                                            viewModel.updateSelectedVideoText { layer ->
+                                                layer.copy(
+                                                    xNorm = (layer.xNorm + pan.x / w).coerceIn(0.04f, 0.96f),
+                                                    yNorm = (layer.yNorm + pan.y / h).coerceIn(0.04f, 0.96f),
+                                                    scale = (layer.scale * zoom).coerceIn(0.25f, 3.0f),
+                                                    rotationDeg = normalizeAngleDeg(layer.rotationDeg + rotation)
+                                                )
+                                            }
+                                        }
                                         CanvasSelectionTarget.PIP -> if (hasActiveUserPip) {
                                             val p = currentState.pip
                                             viewModel.updatePip {
@@ -630,8 +732,8 @@ fun VideoEditorWorkspace(
                                                 )
                                             }
                                         }
-                                        else -> {
-                                            // Pure pinch-scale & pan on Video Frame — NO accidental rotation (rotation is exclusively via top circular rotate handle)
+                                        CanvasSelectionTarget.VIDEO -> if (currentState.clips.isNotEmpty()) {
+                                            // Pure pinch-scale & pan on Video Frame — NO accidental rotation
                                             val s = currentState
                                             viewModel.updateVideoCanvasTransform(
                                                 zoom = if (zoom != 1f) (s.cropZoom * zoom).coerceIn(0.25f, 3.0f) else null,
@@ -640,6 +742,7 @@ fun VideoEditorWorkspace(
                                                 rotationDeg = null
                                             )
                                         }
+                                        CanvasSelectionTarget.NONE -> Unit
                                     }
                                 }
                             }
@@ -656,15 +759,13 @@ fun VideoEditorWorkspace(
                         }
                     }
 
-                    // Pixel-Accurate Interactive White Bounding Box locked cleanly to the exact outer edges of the active video frame across all aspect ratios
-                    if (canvasSelection == CanvasSelectionTarget.VIDEO) {
-                        val srcAspect = activePlayheadClip?.let { c ->
-                            if (c.sourceWidth > 0 && c.sourceHeight > 0) {
-                                c.sourceWidth.toFloat() / c.sourceHeight.toFloat()
-                            } else {
-                                liveSourceAspect
-                            }
-                        } ?: liveSourceAspect
+                    // 1. Tightly Fitted White Bounding Box for Video Frame (hugs exact zoomed-in / zoomed-out frame!)
+                    if (!isStickerCropping && canvasSelection == CanvasSelectionTarget.VIDEO && activePlayheadClip != null) {
+                        val srcAspect = if (activePlayheadClip.sourceWidth > 0 && activePlayheadClip.sourceHeight > 0) {
+                            activePlayheadClip.sourceWidth.toFloat() / activePlayheadClip.sourceHeight.toFloat()
+                        } else {
+                            liveSourceAspect
+                        }
                         val safeSrcAspect = srcAspect.coerceIn(0.25f, 4.0f)
                         val fitW: Float
                         val fitH: Float
@@ -675,16 +776,30 @@ fun VideoEditorWorkspace(
                             fitW = canvasW.toFloat()
                             fitH = fitW / safeSrcAspect
                         }
-                        val stabilizeBoost = if (activePlayheadClip?.stabilizeEnabled == true) 1.09f else 1f
-                        val effZoom = state.cropZoom.coerceIn(0.25f, 3.0f) * stabilizeBoost
-                        val rawFrameW = fitW * effZoom
-                        val rawFrameH = fitH * effZoom
-                        val boxW = rawFrameW.roundToInt().coerceIn(48, canvasW)
-                        val boxH = rawFrameH.roundToInt().coerceIn(48, canvasH)
-                        val centerOffsetX = (state.panX * canvasW * 0.4f).roundToInt()
-                        val centerOffsetY = (state.panY * canvasH * 0.4f).roundToInt()
-                        val leftPx = ((canvasW - boxW) / 2 + centerOffsetX).coerceIn(0, (canvasW - boxW).coerceAtLeast(0))
-                        val topPx = ((canvasH - boxH) / 2 + centerOffsetY).coerceIn(0, (canvasH - boxH).coerceAtLeast(0))
+                        val stabilizeBoost = if (activePlayheadClip.stabilizeEnabled) 1.09f else 1f
+                        val effZoom = state.cropZoom.coerceIn(0.25f, 3.0f) *
+                            activeKeyframeInterp.scale.coerceIn(0.2f, 3.0f) *
+                            stabilizeBoost
+                        val drawW = fitW * effZoom
+                        val drawH = fitH * effZoom
+                        val clampedCx = ImageProcessingEngine.clampFrameCenter(
+                            canvasW / 2f + (state.panX + activeKeyframeInterp.xNorm) * canvasW * 0.4f,
+                            drawW,
+                            canvasW.toFloat()
+                        )
+                        val clampedCy = ImageProcessingEngine.clampFrameCenter(
+                            canvasH / 2f + (state.panY + activeKeyframeInterp.yNorm) * canvasH * 0.4f,
+                            drawH,
+                            canvasH.toFloat()
+                        )
+                        val visLeft = (clampedCx - drawW / 2f).coerceIn(0f, canvasW.toFloat())
+                        val visRight = (clampedCx + drawW / 2f).coerceIn(visLeft, canvasW.toFloat())
+                        val visTop = (clampedCy - drawH / 2f).coerceIn(0f, canvasH.toFloat())
+                        val visBottom = (clampedCy + drawH / 2f).coerceIn(visTop, canvasH.toFloat())
+                        val boxW = (visRight - visLeft).roundToInt().coerceIn(36, canvasW)
+                        val boxH = (visBottom - visTop).roundToInt().coerceIn(36, canvasH)
+                        val leftPx = visLeft.roundToInt().coerceIn(0, (canvasW - boxW).coerceAtLeast(0))
+                        val topPx = visTop.roundToInt().coerceIn(0, (canvasH - boxH).coerceAtLeast(0))
 
                         InteractiveWhiteTransformBox(
                             leftPx = leftPx,
@@ -702,7 +817,6 @@ fun VideoEditorWorkspace(
                                 )
                             },
                             onPinchRotate = { zoom, _ ->
-                                // Pure pinch scale without accidental rotation
                                 val s = currentState
                                 if (zoom != 1f) {
                                     viewModel.updateVideoCanvasTransform(
@@ -715,8 +829,9 @@ fun VideoEditorWorkspace(
                                 viewModel.updateVideoCanvasTransform(zoom = nextZoom)
                             },
                             onRotateDeltaDeg = { deltaDeg ->
+                                val baseRot = activePlayheadClip.rotationDeg
                                 viewModel.updateVideoCanvasTransform(
-                                    rotationDeg = normalizeAngleDeg(selectedClipRotDeg + deltaDeg)
+                                    rotationDeg = normalizeAngleDeg(baseRot + deltaDeg)
                                 )
                             },
                             onTapBox = {
@@ -724,20 +839,113 @@ fun VideoEditorWorkspace(
                             },
                             minCanvasEdge = minCanvasEdge,
                             tagPrefix = "video_canvas",
-                            allowPinchRotate = false
+                            allowPinchRotate = false,
+                            viewportW = canvasW,
+                            viewportH = canvasH
                         )
                     }
 
-                    // Active User-Added PIP Overlay Bounding Box + Corner Handles + Top Rotate + Red "X" Delete
-                    if (hasActiveUserPip) {
-                        val boxW = (canvasW * state.pip.scale).roundToInt().coerceIn(84, (canvasW - 10).coerceAtLeast(84))
-                        val boxH = (canvasH * state.pip.scale).roundToInt().coerceIn(68, (canvasH - 18).coerceAtLeast(68))
-                        val leftPx = ((canvasW * state.pip.xNorm) - boxW / 2f)
-                            .roundToInt()
-                            .coerceIn(4, (canvasW - boxW - 4).coerceAtLeast(4))
-                        val topPx = ((canvasH * state.pip.yNorm) - boxH / 2f)
-                            .roundToInt()
-                            .coerceIn(16, (canvasH - boxH - 4).coerceAtLeast(16))
+                    // 2. Tightly Fitted White Bounding Box for Selected Text or Sticker Layer (hugs exact scaled & cropped bounds!)
+                    if (
+                        !isStickerCropping &&
+                        selectedOverlayLayer != null &&
+                        state.playheadMs in selectedOverlayLayer.startMs..selectedOverlayLayer.endMs &&
+                        (canvasSelection == CanvasSelectionTarget.TEXT || canvasSelection == CanvasSelectionTarget.STICKER)
+                    ) {
+                        val b = VideoOverlayRenderer.measureOverlayBounds(
+                            context = context,
+                            layer = selectedOverlayLayer,
+                            targetW = canvasW.toFloat(),
+                            targetH = canvasH.toFloat()
+                        )
+                        val boxW = b.width.roundToInt().coerceIn(36, canvasW)
+                        val boxH = b.height.roundToInt().coerceIn(36, canvasH)
+                        val leftPx = (b.cx - boxW / 2f).roundToInt().coerceIn(0, (canvasW - boxW).coerceAtLeast(0))
+                        val topPx = (b.cy - boxH / 2f).roundToInt().coerceIn(0, (canvasH - boxH).coerceAtLeast(0))
+
+                        InteractiveWhiteTransformBox(
+                            leftPx = leftPx,
+                            topPx = topPx,
+                            boxW = boxW,
+                            boxH = boxH,
+                            rotationDeg = selectedOverlayLayer.rotationDeg,
+                            showDeleteX = true,
+                            onDeleteClick = {
+                                val delId = selectedOverlayLayer.id
+                                canvasSelection = CanvasSelectionTarget.NONE
+                                viewModel.deleteVideoText(delId)
+                            },
+                            onDragMoveDelta = { dxPx, dyPx ->
+                                viewModel.updateSelectedVideoText { layer ->
+                                    layer.copy(
+                                        xNorm = (layer.xNorm + dxPx / canvasW.toFloat()).coerceIn(0.04f, 0.96f),
+                                        yNorm = (layer.yNorm + dyPx / canvasH.toFloat()).coerceIn(0.04f, 0.96f)
+                                    )
+                                }
+                            },
+                            onPinchRotate = { zoom, rotDeg ->
+                                viewModel.updateSelectedVideoText { layer ->
+                                    layer.copy(
+                                        scale = (layer.scale * zoom).coerceIn(0.25f, 3.0f),
+                                        rotationDeg = normalizeAngleDeg(layer.rotationDeg + rotDeg)
+                                    )
+                                }
+                            },
+                            onCornerScaleDelta = { deltaNorm ->
+                                viewModel.updateSelectedVideoText { layer ->
+                                    layer.copy(scale = (layer.scale + deltaNorm * 1.15f).coerceIn(0.25f, 3.0f))
+                                }
+                            },
+                            onRotateDeltaDeg = { deltaDeg ->
+                                viewModel.updateSelectedVideoText { layer ->
+                                    layer.copy(rotationDeg = normalizeAngleDeg(layer.rotationDeg + deltaDeg))
+                                }
+                            },
+                            onTapBox = {
+                                activeTab = if (selectedOverlayLayer.isSticker) VideoToolTab.STICKER else VideoToolTab.TEXT
+                                isToolDrawerExpanded = true
+                            },
+                            onDoubleTapBox = {
+                                if (selectedOverlayLayer.isSticker) {
+                                    isStickerCropping = true
+                                } else {
+                                    activeTab = VideoToolTab.TEXT
+                                    isToolDrawerExpanded = true
+                                }
+                            },
+                            badgeHint = if (selectedOverlayLayer.isSticker) "Double-tap to crop" else "Double-tap to edit",
+                            minCanvasEdge = minCanvasEdge,
+                            tagPrefix = if (selectedOverlayLayer.isSticker) "sticker_canvas" else "text_canvas",
+                            allowPinchRotate = true,
+                            viewportW = canvasW,
+                            viewportH = canvasH
+                        )
+                    }
+
+                    // 3. Interactive On-Canvas Sticker Crop Mode (Free / 1:1 / 16:9 / 9:16 + Apply & Cancel)
+                    if (isStickerCropping && selectedOverlayLayer != null && selectedOverlayLayer.isSticker) {
+                        StickerInteractiveCropOverlay(
+                            sticker = selectedOverlayLayer,
+                            viewportW = canvasW,
+                            viewportH = canvasH,
+                            onApplyCrop = { l, t, r, b ->
+                                viewModel.updateStickerCrop(selectedOverlayLayer.id, l, t, r, b)
+                                isStickerCropping = false
+                            },
+                            onCancelCrop = {
+                                isStickerCropping = false
+                            }
+                        )
+                    }
+
+                    // 4. Active User-Added PIP Overlay Bounding Box + Corner Handles + Top Rotate + Red "X" Delete
+                    if (!isStickerCropping && hasActiveUserPip) {
+                        val boxW = (canvasW * state.pip.scale).roundToInt().coerceIn(64, canvasW)
+                        val boxH = (canvasH * state.pip.scale).roundToInt().coerceIn(56, canvasH)
+                        val pipCx = ImageProcessingEngine.clampFrameCenter(canvasW * state.pip.xNorm, boxW.toFloat(), canvasW.toFloat())
+                        val pipCy = ImageProcessingEngine.clampFrameCenter(canvasH * state.pip.yNorm, boxH.toFloat(), canvasH.toFloat())
+                        val leftPx = (pipCx - boxW / 2f).roundToInt().coerceIn(0, (canvasW - boxW).coerceAtLeast(0))
+                        val topPx = (pipCy - boxH / 2f).roundToInt().coerceIn(0, (canvasH - boxH).coerceAtLeast(0))
 
                         if (canvasSelection == CanvasSelectionTarget.PIP) {
                             InteractiveWhiteTransformBox(
@@ -781,7 +989,9 @@ fun VideoEditorWorkspace(
                                     canvasSelection = CanvasSelectionTarget.NONE
                                 },
                                 minCanvasEdge = minCanvasEdge,
-                                tagPrefix = "pip_canvas"
+                                tagPrefix = "pip_canvas",
+                                viewportW = canvasW,
+                                viewportH = canvasH
                             )
                         } else {
                             // Unselected active PIP still shows clean subtle frame + 1-tap Red "X" corner button
@@ -1304,6 +1514,38 @@ fun VideoEditorWorkspace(
                             ) {
                                 Spacer(Modifier.width(halfViewportDp))
 
+                                if (state.clips.isEmpty()) {
+                                    Surface(
+                                        onClick = {
+                                            videoPicker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.VideoOnly))
+                                        },
+                                        shape = RoundedCornerShape(8.dp),
+                                        color = StudioSurface,
+                                        border = BorderStroke(1.dp, StudioBorder),
+                                        modifier = Modifier
+                                            .height(48.dp)
+                                            .testTag("empty_video_timeline_placeholder")
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.padding(horizontal = 14.dp),
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Default.Add,
+                                                contentDescription = "Add Video Clip",
+                                                tint = ElectricCyan,
+                                                modifier = Modifier.size(16.dp)
+                                            )
+                                            Text(
+                                                text = "Tap + to add video clip",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = TextSecondary
+                                            )
+                                        }
+                                    }
+                                }
+
                                 state.clips.forEachIndexed { idx, clip ->
                                     val isSel = state.selectedClipId != null && clip.id == state.selectedClipId
                                     val thumbs = clipThumbnails[clip.id].orEmpty()
@@ -1318,6 +1560,7 @@ fun VideoEditorWorkspace(
                                                 isClipQuickBarVisible = !isClipQuickBarVisible
                                             } else {
                                                 viewModel.selectClip(clip.id)
+                                                canvasSelection = CanvasSelectionTarget.VIDEO
                                                 isClipQuickBarVisible = true
                                             }
                                         },
@@ -1330,6 +1573,29 @@ fun VideoEditorWorkspace(
                                         modifier = Modifier
                                             .width(clipWidthDp)
                                             .height(48.dp)
+                                            .then(
+                                                if (isSel && state.clips.size > 1) {
+                                                    Modifier.pointerInput("video_body_reorder_${clip.id}") {
+                                                        val swapThresholdPx = with(density) { 52.dp.toPx() }
+                                                        var accumDx = 0f
+                                                        detectHorizontalDragGestures(
+                                                            onDragStart = { accumDx = 0f },
+                                                            onDragEnd = { accumDx = 0f },
+                                                            onDragCancel = { accumDx = 0f }
+                                                        ) { change, dragAmount ->
+                                                            change.consume()
+                                                            accumDx += dragAmount
+                                                            if (accumDx > swapThresholdPx) {
+                                                                viewModel.reorderClip(currentClip.id, moveLeft = false)
+                                                                accumDx = 0f
+                                                            } else if (accumDx < -swapThresholdPx) {
+                                                                viewModel.reorderClip(currentClip.id, moveLeft = true)
+                                                                accumDx = 0f
+                                                            }
+                                                        }
+                                                    }
+                                                } else Modifier
+                                            )
                                             .testTag("filmstrip_clip_$idx")
                                     ) {
                                         Box(modifier = Modifier.fillMaxSize()) {
@@ -1361,8 +1627,8 @@ fun VideoEditorWorkspace(
                                                         )
                                                     )
                                                     .padding(
-                                                        start = if (isSel) 18.dp else 6.dp,
-                                                        end = if (isSel) 18.dp else 6.dp,
+                                                        start = if (isSel) 20.dp else 6.dp,
+                                                        end = if (isSel) 20.dp else 6.dp,
                                                         top = 3.dp,
                                                         bottom = 3.dp
                                                     )
@@ -1391,6 +1657,34 @@ fun VideoEditorWorkspace(
                                                         style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp),
                                                         color = if (isSel) ElectricCyan else TextSecondary
                                                     )
+                                                }
+                                            }
+
+                                            // Direct 1-tap Red Trash Delete badge on Selected Video Clip
+                                            if (isSel) {
+                                                Surface(
+                                                    onClick = {
+                                                        viewModel.deleteVideoClipById(clip.id)
+                                                        isClipQuickBarVisible = false
+                                                    },
+                                                    shape = CircleShape,
+                                                    color = SignalRed,
+                                                    border = BorderStroke(1.dp, Color.White),
+                                                    modifier = Modifier
+                                                        .align(Alignment.TopEnd)
+                                                        .padding(end = 21.dp, top = 2.dp)
+                                                        .size(18.dp)
+                                                        .zIndex(7f)
+                                                        .testTag("timeline_video_delete_${clip.id}")
+                                                ) {
+                                                    Box(contentAlignment = Alignment.Center) {
+                                                        Icon(
+                                                            imageVector = Icons.Default.Delete,
+                                                            contentDescription = "Delete ${clip.name}",
+                                                            tint = Color.White,
+                                                            modifier = Modifier.size(11.dp)
+                                                        )
+                                                    }
                                                 }
                                             }
 
@@ -1428,23 +1722,32 @@ fun VideoEditorWorkspace(
                                                 }
                                             }
 
-                                            // Direct Touch-and-Drag Left & Right Trim Handles on Selected Clip
+                                            // Immediate-Claim Left & Right Trim Handles (never stolen by horizontalScroll)
                                             if (isSel) {
                                                 Box(
                                                     modifier = Modifier
                                                         .align(Alignment.CenterStart)
-                                                        .width(16.dp)
+                                                        .width(18.dp)
                                                         .fillMaxHeight()
                                                         .background(Color.White)
-                                                        .pointerInput(clip.id) {
-                                                            detectHorizontalDragGestures { change, dragAmount ->
-                                                                change.consume()
-                                                                val msPerPx = (1000f / (pxPerSecBase * density.density * currentZoom)) * currentClip.speed
-                                                                val deltaMs = (dragAmount * msPerPx).toLong()
-                                                                val maxStart = (currentClip.trimEndMs - 300L).coerceAtLeast(0L)
-                                                                val nextStart = (currentClip.trimStartMs + deltaMs).coerceIn(0L, maxStart)
-                                                                if (nextStart != currentClip.trimStartMs) {
-                                                                    viewModel.updateSelectedClip { it.copy(trimStartMs = nextStart) }
+                                                        .zIndex(9f)
+                                                        .pointerInput("video_trim_l_${clip.id}") {
+                                                            awaitEachGesture {
+                                                                val down = awaitFirstDown(requireUnconsumed = true)
+                                                                down.consume()
+                                                                var prevX = down.position.x
+                                                                while (true) {
+                                                                    val ev = awaitPointerEvent()
+                                                                    val cur = ev.changes.firstOrNull { it.pressed } ?: break
+                                                                    val dragAmount = cur.position.x - prevX
+                                                                    prevX = cur.position.x
+                                                                    if (abs(dragAmount) > 0.25f) {
+                                                                        val msPerPx = (1000f / (pxPerSecBase * density.density * currentZoom)) * currentClip.speed
+                                                                        val deltaMs = (dragAmount * msPerPx).toLong()
+                                                                        val nextStart = (currentClip.trimStartMs + deltaMs).coerceAtLeast(0L)
+                                                                        viewModel.trimVideoClipByHandle(currentClip.id, newTrimStartMs = nextStart)
+                                                                    }
+                                                                    cur.consume()
                                                                 }
                                                             }
                                                         }
@@ -1463,18 +1766,27 @@ fun VideoEditorWorkspace(
                                                 Box(
                                                     modifier = Modifier
                                                         .align(Alignment.CenterEnd)
-                                                        .width(16.dp)
+                                                        .width(18.dp)
                                                         .fillMaxHeight()
                                                         .background(Color.White)
-                                                        .pointerInput(clip.id) {
-                                                            detectHorizontalDragGestures { change, dragAmount ->
-                                                                change.consume()
-                                                                val msPerPx = (1000f / (pxPerSecBase * density.density * currentZoom)) * currentClip.speed
-                                                                val deltaMs = (dragAmount * msPerPx).toLong()
-                                                                val minEnd = (currentClip.trimStartMs + 300L).coerceAtMost(currentClip.durationMs)
-                                                                val nextEnd = (currentClip.trimEndMs + deltaMs).coerceIn(minEnd, currentClip.durationMs)
-                                                                if (nextEnd != currentClip.trimEndMs) {
-                                                                    viewModel.updateSelectedClip { it.copy(trimEndMs = nextEnd) }
+                                                        .zIndex(9f)
+                                                        .pointerInput("video_trim_r_${clip.id}") {
+                                                            awaitEachGesture {
+                                                                val down = awaitFirstDown(requireUnconsumed = true)
+                                                                down.consume()
+                                                                var prevX = down.position.x
+                                                                while (true) {
+                                                                    val ev = awaitPointerEvent()
+                                                                    val cur = ev.changes.firstOrNull { it.pressed } ?: break
+                                                                    val dragAmount = cur.position.x - prevX
+                                                                    prevX = cur.position.x
+                                                                    if (abs(dragAmount) > 0.25f) {
+                                                                        val msPerPx = (1000f / (pxPerSecBase * density.density * currentZoom)) * currentClip.speed
+                                                                        val deltaMs = (dragAmount * msPerPx).toLong()
+                                                                        val nextEnd = (currentClip.trimEndMs + deltaMs).coerceAtLeast(300L)
+                                                                        viewModel.trimVideoClipByHandle(currentClip.id, newTrimEndMs = nextEnd)
+                                                                    }
+                                                                    cur.consume()
                                                                 }
                                                             }
                                                         }
@@ -1564,7 +1876,7 @@ fun VideoEditorWorkspace(
                             }
                         }
 
-                        // Row 2: Full-Width Draggable Audio / Voiceover Waveform Track Bars beneath Video Track
+                        // Row 2: Full-Width Draggable & Trimmable Audio / Voiceover Waveform Track Bars
                         if (state.audioLaneClips.isEmpty()) {
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Spacer(Modifier.width(halfViewportDp))
@@ -1618,13 +1930,13 @@ fun VideoEditorWorkspace(
                                     }
                                     val currentAudioClip by rememberUpdatedState(aClip)
                                     val currentZoom by rememberUpdatedState(timelineZoom)
-                                     val effectiveAudioMs = (aClip.durationMs * (aClip.trimEndPct - aClip.trimStartPct))
+                                    val effectiveAudioMs = (aClip.durationMs * (aClip.trimEndPct - aClip.trimStartPct))
                                         .toLong()
                                         .coerceAtLeast(350L)
                                     val xOffsetDp = ((aClip.startMs / 1000f) * pxPerSecBase * timelineZoom).dp
                                     val barWidthDp = ((effectiveAudioMs / 1000f) * pxPerSecBase * timelineZoom)
                                         .dp
-                                        .coerceIn(56.dp, maxOf(totalClipsWidthDp, 480.dp))
+                                        .coerceIn(64.dp, maxOf(totalClipsWidthDp, 560.dp))
                                     val laneTotalWidthDp = maxOf(totalClipsWidthDp, xOffsetDp + barWidthDp + 16.dp)
 
                                     Row(verticalAlignment = Alignment.CenterVertically) {
@@ -1637,6 +1949,7 @@ fun VideoEditorWorkspace(
                                             Surface(
                                                 onClick = {
                                                     viewModel.selectVideoAudioClip(aClip.id)
+                                                    canvasSelection = CanvasSelectionTarget.NONE
                                                     isClipQuickBarVisible = false
                                                     activeTab = VideoToolTab.AUDIO
                                                     isToolDrawerExpanded = true
@@ -1651,19 +1964,36 @@ fun VideoEditorWorkspace(
                                                     .offset(x = xOffsetDp)
                                                     .width(barWidthDp)
                                                     .height(36.dp)
-                                                    .pointerInput(aClip.id) {
-                                                        detectHorizontalDragGestures { change, dragAmount ->
-                                                            change.consume()
-                                                            val msPerPx = 1000f / (pxPerSecBase * density.density * currentZoom)
-                                                            val deltaMs = (dragAmount * msPerPx).toLong()
-                                                            val nextStart = (currentAudioClip.startMs + deltaMs).coerceAtLeast(0L)
-                                                            viewModel.moveVideoAudioClip(currentAudioClip.id, nextStart)
-                                                        }
-                                                    }
+                                                    .then(
+                                                        if (isSelAudio) {
+                                                            Modifier.pointerInput("audio_body_drag_${aClip.id}") {
+                                                                awaitEachGesture {
+                                                                    val down = awaitFirstDown(requireUnconsumed = true)
+                                                                    var prevX = down.position.x
+                                                                    var dragging = false
+                                                                    while (true) {
+                                                                        val ev = awaitPointerEvent()
+                                                                        val cur = ev.changes.firstOrNull { it.pressed } ?: break
+                                                                        val dx = cur.position.x - prevX
+                                                                        if (!dragging && abs(cur.position.x - down.position.x) > viewConfiguration.touchSlop) {
+                                                                            dragging = true
+                                                                        }
+                                                                        if (dragging && abs(dx) > 0.25f) {
+                                                                            val msPerPx = 1000f / (pxPerSecBase * density.density * currentZoom)
+                                                                            val deltaMs = (dx * msPerPx).toLong()
+                                                                            val nextStart = (currentAudioClip.startMs + deltaMs).coerceAtLeast(0L)
+                                                                            viewModel.moveVideoAudioClip(currentAudioClip.id, nextStart)
+                                                                            cur.consume()
+                                                                        }
+                                                                        prevX = cur.position.x
+                                                                    }
+                                                                }
+                                                            }
+                                                        } else Modifier
+                                                    )
                                                     .testTag("audio_waveform_bar_${aClip.id}")
                                             ) {
                                                 Box(modifier = Modifier.fillMaxSize()) {
-                                                    // Precomputed Waveform Amplitudes for zero-lag 60fps scrolling
                                                     val waveformBars = remember(aClip.id) {
                                                         val seed = aClip.id.hashCode().toFloat()
                                                         FloatArray(96) { i ->
@@ -1677,7 +2007,7 @@ fun VideoEditorWorkspace(
                                                         modifier = Modifier
                                                             .fillMaxSize()
                                                             .padding(
-                                                                horizontal = if (isSelAudio) 16.dp else 4.dp,
+                                                                horizontal = if (isSelAudio) 18.dp else 4.dp,
                                                                 vertical = 4.dp
                                                             )
                                                     ) {
@@ -1700,11 +2030,10 @@ fun VideoEditorWorkspace(
                                                         }
                                                     }
 
-                                                    // Track label + Volume overlay
                                                     Row(
                                                         modifier = Modifier
                                                             .fillMaxSize()
-                                                            .padding(horizontal = if (isSelAudio) 18.dp else 8.dp),
+                                                            .padding(horizontal = if (isSelAudio) 20.dp else 8.dp),
                                                         verticalAlignment = Alignment.CenterVertically,
                                                         horizontalArrangement = Arrangement.spacedBy(5.dp)
                                                     ) {
@@ -1735,31 +2064,42 @@ fun VideoEditorWorkspace(
                                                         )
                                                     }
 
-                                                    // Direct Left & Right Drag Trim Handles when Audio Bar is Selected
+                                                    // Immediate-Claim Left & Right Drag Trim Handles on Audio Bar
                                                     if (isSelAudio) {
                                                         Box(
                                                             modifier = Modifier
                                                                 .align(Alignment.CenterStart)
-                                                                .width(14.dp)
+                                                                .width(18.dp)
                                                                 .fillMaxHeight()
                                                                 .background(Color.White)
-                                                                .zIndex(5f)
+                                                                .zIndex(9f)
                                                                 .pointerInput("audio_trim_l_${aClip.id}") {
-                                                                    detectHorizontalDragGestures { change, dragAmount ->
-                                                                        change.consume()
-                                                                        val msPerPx = 1000f / (pxPerSecBase * density.density * currentZoom)
-                                                                        val deltaMs = dragAmount * msPerPx
-                                                                        val durMs = currentAudioClip.durationMs.coerceAtLeast(500L).toFloat()
-                                                                        val deltaPct = deltaMs / durMs
-                                                                        val nextStartPct = (currentAudioClip.trimStartPct + deltaPct)
-                                                                            .coerceIn(0f, (currentAudioClip.trimEndPct - 0.08f).coerceAtLeast(0f))
-                                                                        val appliedDeltaMs = ((nextStartPct - currentAudioClip.trimStartPct) * durMs).toLong()
-                                                                        val nextStartMs = (currentAudioClip.startMs + appliedDeltaMs).coerceAtLeast(0L)
-                                                                        viewModel.trimVideoAudioClip(
-                                                                            id = currentAudioClip.id,
-                                                                            trimStartPct = nextStartPct,
-                                                                            startMs = nextStartMs
-                                                                        )
+                                                                    awaitEachGesture {
+                                                                        val down = awaitFirstDown(requireUnconsumed = true)
+                                                                        down.consume()
+                                                                        var prevX = down.position.x
+                                                                        while (true) {
+                                                                            val ev = awaitPointerEvent()
+                                                                            val cur = ev.changes.firstOrNull { it.pressed } ?: break
+                                                                            val dragAmount = cur.position.x - prevX
+                                                                            prevX = cur.position.x
+                                                                            if (abs(dragAmount) > 0.25f) {
+                                                                                val msPerPx = 1000f / (pxPerSecBase * density.density * currentZoom)
+                                                                                val deltaMs = dragAmount * msPerPx
+                                                                                val durMs = currentAudioClip.durationMs.coerceAtLeast(500L).toFloat()
+                                                                                val deltaPct = deltaMs / durMs
+                                                                                val nextStartPct = (currentAudioClip.trimStartPct + deltaPct)
+                                                                                    .coerceIn(0f, (currentAudioClip.trimEndPct - 0.06f).coerceAtLeast(0f))
+                                                                                val appliedDeltaMs = ((nextStartPct - currentAudioClip.trimStartPct) * durMs).toLong()
+                                                                                val nextStartMs = (currentAudioClip.startMs + appliedDeltaMs).coerceAtLeast(0L)
+                                                                                viewModel.trimVideoAudioClip(
+                                                                                    id = currentAudioClip.id,
+                                                                                    trimStartPct = nextStartPct,
+                                                                                    startMs = nextStartMs
+                                                                                )
+                                                                            }
+                                                                            cur.consume()
+                                                                        }
                                                                     }
                                                                 }
                                                                 .testTag("audio_trim_handle_left_${aClip.id}"),
@@ -1777,23 +2117,45 @@ fun VideoEditorWorkspace(
                                                         Box(
                                                             modifier = Modifier
                                                                 .align(Alignment.CenterEnd)
-                                                                .width(14.dp)
+                                                                .width(18.dp)
                                                                 .fillMaxHeight()
                                                                 .background(Color.White)
-                                                                .zIndex(5f)
+                                                                .zIndex(9f)
                                                                 .pointerInput("audio_trim_r_${aClip.id}") {
-                                                                    detectHorizontalDragGestures { change, dragAmount ->
-                                                                        change.consume()
-                                                                        val msPerPx = 1000f / (pxPerSecBase * density.density * currentZoom)
-                                                                        val deltaMs = dragAmount * msPerPx
-                                                                        val durMs = currentAudioClip.durationMs.coerceAtLeast(500L).toFloat()
-                                                                        val deltaPct = deltaMs / durMs
-                                                                        val nextEndPct = (currentAudioClip.trimEndPct + deltaPct)
-                                                                            .coerceIn((currentAudioClip.trimStartPct + 0.08f).coerceAtMost(1f), 1f)
-                                                                        viewModel.trimVideoAudioClip(
-                                                                            id = currentAudioClip.id,
-                                                                            trimEndPct = nextEndPct
-                                                                        )
+                                                                    awaitEachGesture {
+                                                                        val down = awaitFirstDown(requireUnconsumed = true)
+                                                                        down.consume()
+                                                                        var prevX = down.position.x
+                                                                        while (true) {
+                                                                            val ev = awaitPointerEvent()
+                                                                            val cur = ev.changes.firstOrNull { it.pressed } ?: break
+                                                                            val dragAmount = cur.position.x - prevX
+                                                                            prevX = cur.position.x
+                                                                            if (abs(dragAmount) > 0.25f) {
+                                                                                val msPerPx = 1000f / (pxPerSecBase * density.density * currentZoom)
+                                                                                val deltaMs = dragAmount * msPerPx
+                                                                                val durMs = currentAudioClip.durationMs.coerceAtLeast(500L).toFloat()
+                                                                                val rawNextPct = currentAudioClip.trimEndPct + (deltaMs / durMs)
+                                                                                if (rawNextPct > 1f) {
+                                                                                    val extendedDur = (currentAudioClip.durationMs + deltaMs.toLong()).coerceIn(500L, 60_000L)
+                                                                                    viewModel.trimVideoAudioClip(
+                                                                                        id = currentAudioClip.id,
+                                                                                        trimEndPct = 1f,
+                                                                                        durationMs = extendedDur
+                                                                                    )
+                                                                                } else {
+                                                                                    val nextEndPct = rawNextPct.coerceIn(
+                                                                                        (currentAudioClip.trimStartPct + 0.06f).coerceAtMost(1f),
+                                                                                        1f
+                                                                                    )
+                                                                                    viewModel.trimVideoAudioClip(
+                                                                                        id = currentAudioClip.id,
+                                                                                        trimEndPct = nextEndPct
+                                                                                    )
+                                                                                }
+                                                                            }
+                                                                            cur.consume()
+                                                                        }
                                                                     }
                                                                 }
                                                                 .testTag("audio_trim_handle_right_${aClip.id}"),
@@ -1809,6 +2171,26 @@ fun VideoEditorWorkspace(
                                                         }
                                                     }
                                                 }
+                                            }
+                                        }
+                                        Spacer(Modifier.width(6.dp))
+                                        // Direct 1-tap Red Trash icon next to every Audio Track (e.g., "Crimson Synth Beat")
+                                        Surface(
+                                            onClick = { viewModel.deleteVideoAudioClip(aClip.id) },
+                                            shape = RoundedCornerShape(7.dp),
+                                            color = SignalRed.copy(alpha = 0.16f),
+                                            border = BorderStroke(1.dp, SignalRed.copy(alpha = 0.75f)),
+                                            modifier = Modifier
+                                                .size(width = 34.dp, height = 36.dp)
+                                                .testTag("timeline_audio_delete_${aClip.id}")
+                                        ) {
+                                            Box(contentAlignment = Alignment.Center) {
+                                                Icon(
+                                                    imageVector = Icons.Default.Delete,
+                                                    contentDescription = "Delete ${aClip.name}",
+                                                    tint = SignalRed,
+                                                    modifier = Modifier.size(16.dp)
+                                                )
                                             }
                                         }
                                         Spacer(Modifier.width(6.dp))
@@ -1830,6 +2212,226 @@ fun VideoEditorWorkspace(
                                                     contentDescription = "Add Audio",
                                                     tint = NeonViolet,
                                                     modifier = Modifier.size(16.dp)
+                                                )
+                                            }
+                                        }
+                                        Spacer(Modifier.width(halfViewportDp))
+                                    }
+                                }
+                            }
+                        }
+
+                        // Row 3: Draggable & Trimmable Text and Sticker Timeline Tracks + 1-Tap Red Trash Delete
+                        if (state.textLayers.isNotEmpty()) {
+                            Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                                state.textLayers.forEach { tLayer ->
+                                    val isSelTxt = state.selectedTextId == tLayer.id
+                                    val currentLayer by rememberUpdatedState(tLayer)
+                                    val currentZoom by rememberUpdatedState(timelineZoom)
+                                    val layerAccent = if (tLayer.isSticker) ProAmber else ElectricCyan
+                                    val txtOffsetDp = ((tLayer.startMs / 1000f) * pxPerSecBase * timelineZoom).dp
+                                    val txtDurMs = (tLayer.endMs - tLayer.startMs).coerceAtLeast(300L)
+                                    val txtWidthDp = ((txtDurMs / 1000f) * pxPerSecBase * timelineZoom)
+                                        .dp
+                                        .coerceIn(78.dp, maxOf(totalClipsWidthDp, 560.dp))
+                                    val laneTotalW = maxOf(totalClipsWidthDp, txtOffsetDp + txtWidthDp + 16.dp)
+
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Spacer(Modifier.width(halfViewportDp))
+                                        Box(
+                                            modifier = Modifier
+                                                .width(laneTotalW)
+                                                .height(34.dp)
+                                        ) {
+                                            Surface(
+                                                onClick = {
+                                                    viewModel.selectVideoText(tLayer.id)
+                                                    isClipQuickBarVisible = false
+                                                    isStickerCropping = false
+                                                    canvasSelection = if (tLayer.isSticker) {
+                                                        CanvasSelectionTarget.STICKER
+                                                    } else {
+                                                        CanvasSelectionTarget.TEXT
+                                                    }
+                                                    activeTab = if (tLayer.isSticker) VideoToolTab.STICKER else VideoToolTab.TEXT
+                                                    isToolDrawerExpanded = true
+                                                },
+                                                shape = RoundedCornerShape(7.dp),
+                                                color = layerAccent.copy(alpha = if (isSelTxt) 0.28f else 0.15f),
+                                                border = BorderStroke(
+                                                    width = if (isSelTxt) 2.dp else 1.dp,
+                                                    color = if (isSelTxt) Color.White else layerAccent.copy(alpha = 0.75f)
+                                                ),
+                                                modifier = Modifier
+                                                    .offset(x = txtOffsetDp)
+                                                    .width(txtWidthDp)
+                                                    .height(34.dp)
+                                                    .then(
+                                                        if (isSelTxt) {
+                                                            Modifier.pointerInput("overlay_body_drag_${tLayer.id}") {
+                                                                awaitEachGesture {
+                                                                    val down = awaitFirstDown(requireUnconsumed = true)
+                                                                    var prevX = down.position.x
+                                                                    var dragging = false
+                                                                    while (true) {
+                                                                        val ev = awaitPointerEvent()
+                                                                        val cur = ev.changes.firstOrNull { it.pressed } ?: break
+                                                                        val dx = cur.position.x - prevX
+                                                                        if (!dragging && abs(cur.position.x - down.position.x) > viewConfiguration.touchSlop) {
+                                                                            dragging = true
+                                                                        }
+                                                                        if (dragging && abs(dx) > 0.25f) {
+                                                                            val msPerPx = 1000f / (pxPerSecBase * density.density * currentZoom)
+                                                                            val deltaMs = (dx * msPerPx).toLong()
+                                                                            val nextStart = (currentLayer.startMs + deltaMs).coerceAtLeast(0L)
+                                                                            viewModel.moveVideoTextOverlay(currentLayer.id, nextStart)
+                                                                            cur.consume()
+                                                                        }
+                                                                        prevX = cur.position.x
+                                                                    }
+                                                                }
+                                                            }
+                                                        } else Modifier
+                                                    )
+                                                    .testTag("timeline_text_bar_${tLayer.id}")
+                                            ) {
+                                                Box(modifier = Modifier.fillMaxSize()) {
+                                                    Row(
+                                                        modifier = Modifier
+                                                            .fillMaxSize()
+                                                            .padding(horizontal = if (isSelTxt) 20.dp else 8.dp),
+                                                        verticalAlignment = Alignment.CenterVertically,
+                                                        horizontalArrangement = Arrangement.spacedBy(5.dp)
+                                                    ) {
+                                                        Icon(
+                                                            imageVector = if (tLayer.isSticker) Icons.Default.Photo else Icons.Default.Title,
+                                                            contentDescription = null,
+                                                            tint = layerAccent,
+                                                            modifier = Modifier.size(13.dp)
+                                                        )
+                                                        Text(
+                                                            text = tLayer.text,
+                                                            style = MaterialTheme.typography.labelSmall.copy(
+                                                                fontWeight = FontWeight.Bold,
+                                                                fontSize = 10.sp
+                                                            ),
+                                                            color = Color.White,
+                                                            maxLines = 1,
+                                                            overflow = TextOverflow.Ellipsis,
+                                                            modifier = Modifier.weight(1f)
+                                                        )
+                                                        Text(
+                                                            text = String.format(Locale.US, "%.1fs", txtDurMs / 1000f),
+                                                            style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp),
+                                                            color = Color.White.copy(alpha = 0.85f)
+                                                        )
+                                                    }
+
+                                                    // Immediate-Claim Left & Right White Trim Handles for Text & Stickers
+                                                    if (isSelTxt) {
+                                                        Box(
+                                                            modifier = Modifier
+                                                                .align(Alignment.CenterStart)
+                                                                .width(18.dp)
+                                                                .fillMaxHeight()
+                                                                .background(Color.White)
+                                                                .zIndex(9f)
+                                                                .pointerInput("overlay_trim_l_${tLayer.id}") {
+                                                                    awaitEachGesture {
+                                                                        val down = awaitFirstDown(requireUnconsumed = true)
+                                                                        down.consume()
+                                                                        var prevX = down.position.x
+                                                                        while (true) {
+                                                                            val ev = awaitPointerEvent()
+                                                                            val cur = ev.changes.firstOrNull { it.pressed } ?: break
+                                                                            val dx = cur.position.x - prevX
+                                                                            prevX = cur.position.x
+                                                                            if (abs(dx) > 0.25f) {
+                                                                                val msPerPx = 1000f / (pxPerSecBase * density.density * currentZoom)
+                                                                                val deltaMs = (dx * msPerPx).toLong()
+                                                                                val nextStart = (currentLayer.startMs + deltaMs).coerceAtLeast(0L)
+                                                                                viewModel.trimVideoTextOverlay(currentLayer.id, newStartMs = nextStart)
+                                                                            }
+                                                                            cur.consume()
+                                                                        }
+                                                                    }
+                                                                }
+                                                                .testTag("overlay_trim_handle_left_${tLayer.id}"),
+                                                            contentAlignment = Alignment.Center
+                                                        ) {
+                                                            Box(
+                                                                modifier = Modifier
+                                                                    .width(2.5.dp)
+                                                                    .height(14.dp)
+                                                                    .clip(RoundedCornerShape(2.dp))
+                                                                    .background(OledBlack)
+                                                            )
+                                                        }
+
+                                                        Box(
+                                                            modifier = Modifier
+                                                                .align(Alignment.CenterEnd)
+                                                                .width(18.dp)
+                                                                .fillMaxHeight()
+                                                                .background(Color.White)
+                                                                .zIndex(9f)
+                                                                .pointerInput("overlay_trim_r_${tLayer.id}") {
+                                                                    awaitEachGesture {
+                                                                        val down = awaitFirstDown(requireUnconsumed = true)
+                                                                        down.consume()
+                                                                        var prevX = down.position.x
+                                                                        while (true) {
+                                                                            val ev = awaitPointerEvent()
+                                                                            val cur = ev.changes.firstOrNull { it.pressed } ?: break
+                                                                            val dx = cur.position.x - prevX
+                                                                            prevX = cur.position.x
+                                                                            if (abs(dx) > 0.25f) {
+                                                                                val msPerPx = 1000f / (pxPerSecBase * density.density * currentZoom)
+                                                                                val deltaMs = (dx * msPerPx).toLong()
+                                                                                val nextEnd = (currentLayer.endMs + deltaMs).coerceAtLeast(300L)
+                                                                                viewModel.trimVideoTextOverlay(currentLayer.id, newEndMs = nextEnd)
+                                                                            }
+                                                                            cur.consume()
+                                                                        }
+                                                                    }
+                                                                }
+                                                                .testTag("overlay_trim_handle_right_${tLayer.id}"),
+                                                            contentAlignment = Alignment.Center
+                                                        ) {
+                                                            Box(
+                                                                modifier = Modifier
+                                                                    .width(2.5.dp)
+                                                                    .height(14.dp)
+                                                                    .clip(RoundedCornerShape(2.dp))
+                                                                    .background(OledBlack)
+                                                            )
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Spacer(Modifier.width(6.dp))
+                                        Surface(
+                                            onClick = {
+                                                if (state.selectedTextId == tLayer.id) {
+                                                    canvasSelection = CanvasSelectionTarget.NONE
+                                                    isStickerCropping = false
+                                                }
+                                                viewModel.deleteVideoText(tLayer.id)
+                                            },
+                                            shape = RoundedCornerShape(7.dp),
+                                            color = SignalRed.copy(alpha = 0.16f),
+                                            border = BorderStroke(1.dp, SignalRed.copy(alpha = 0.75f)),
+                                            modifier = Modifier
+                                                .size(width = 34.dp, height = 34.dp)
+                                                .testTag("timeline_text_delete_${tLayer.id}")
+                                        ) {
+                                            Box(contentAlignment = Alignment.Center) {
+                                                Icon(
+                                                    imageVector = Icons.Default.Delete,
+                                                    contentDescription = "Delete ${tLayer.text}",
+                                                    tint = SignalRed,
+                                                    modifier = Modifier.size(15.dp)
                                                 )
                                             }
                                         }
@@ -2547,7 +3149,7 @@ fun VideoEditorWorkspace(
                                 }
                             }
                             when (frameControl) {
-                                VideoFrameControl.ZOOM -> StudioSliderRow("Zoom", state.cropZoom, 0.6f..2.4f, "${(state.cropZoom * 100).roundToInt()}%") { viewModel.updateVideoFraming(zoom = it) }
+                                VideoFrameControl.ZOOM -> StudioSliderRow("Zoom", state.cropZoom, 0.25f..3.0f, "${(state.cropZoom * 100).roundToInt()}%") { viewModel.updateVideoFraming(zoom = it) }
                                 VideoFrameControl.PAN_X -> StudioSliderRow("Left / Right", state.panX, -1f..1f, "${(state.panX * 100).roundToInt()}%") { viewModel.updateVideoFraming(panX = it) }
                                 VideoFrameControl.PAN_Y -> StudioSliderRow("Up / Down", state.panY, -1f..1f, "${(state.panY * 100).roundToInt()}%") { viewModel.updateVideoFraming(panY = it) }
                                 VideoFrameControl.ROTATE -> if (clip != null) {
@@ -2811,7 +3413,7 @@ fun VideoEditorWorkspace(
                                     VideoKeyframeControl.ROTATE -> StudioSliderRow("Keyframe Rotate", interp.rotationDeg, -180f..180f, "${interp.rotationDeg.roundToInt()}°") { v ->
                                         viewModel.addOrUpdateKeyframeAtPlayhead(rotationDeg = v)
                                     }
-                                    VideoKeyframeControl.OPACITY -> StudioSliderRow("Keyframe Opacity", interp.opacity, 0.1f..1f, "${(interp.opacity * 100).roundToInt()}%") { v ->
+                                    VideoKeyframeControl.OPACITY -> StudioSliderRow("Keyframe Opacity", interp.opacity, 0f..1f, "${(interp.opacity * 100).roundToInt()}%") { v ->
                                         viewModel.addOrUpdateKeyframeAtPlayhead(opacity = v)
                                     }
                                 }
@@ -2819,187 +3421,91 @@ fun VideoEditorWorkspace(
                         }
 
                         VideoToolTab.TEXT -> {
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .horizontalScroll(rememberScrollState()),
-                                horizontalArrangement = Arrangement.spacedBy(8.dp)
-                            ) {
-                                StudioActionPill(
-                                    label = "+ Text",
-                                    icon = Icons.Default.Title,
-                                    onClick = { viewModel.addVideoText("NEW TITLE", isCaption = false) }
-                                )
-                                StudioActionPill(
-                                    label = "Stickers",
-                                    icon = Icons.Default.Photo,
-                                    accent = ProAmber,
-                                    onClick = { showStickerRow = !showStickerRow }
-                                )
-                                StudioActionPill(
-                                    label = if (state.isListeningCaptions) "Listening..." else "Auto Captions",
-                                    icon = Icons.Default.ClosedCaption,
-                                    accent = NeonViolet,
-                                    onClick = {
-                                        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-                                            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-                                            putExtra(RecognizerIntent.EXTRA_PROMPT, "Speak to add captions")
-                                        }
-                                        runCatching {
-                                            viewModel.setListeningCaptions(true)
-                                            speechCaptionLauncher.launch(intent)
-                                        }.onFailure {
-                                            viewModel.setListeningCaptions(false)
-                                            viewModel.addVideoText("Tap to edit caption", isCaption = true)
-                                            viewModel.showToast("Caption added — tap to edit")
-                                        }
+                            ProTextEditingToolbar(
+                                textLayers = state.textLayers,
+                                selectedTextId = state.selectedTextId,
+                                isListeningCaptions = state.isListeningCaptions,
+                                onAddText = {
+                                    viewModel.addVideoText("NEW TITLE", isCaption = false)
+                                    canvasSelection = CanvasSelectionTarget.TEXT
+                                },
+                                onOpenStickersTab = {
+                                    activeTab = VideoToolTab.STICKER
+                                    isToolDrawerExpanded = true
+                                },
+                                onLaunchAutoCaptions = {
+                                    val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                                        putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                                        putExtra(RecognizerIntent.EXTRA_PROMPT, "Speak to add captions")
                                     }
-                                )
-                            }
-
-                            if (showStickerRow) {
-                                Row(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .horizontalScroll(rememberScrollState()),
-                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                                ) {
-                                    listOf("🔥", "⚡", "👑", "🎬", "⭐", "❤️", "💯", "🚀").forEach { sym ->
-                                        StudioChipButton(
-                                            text = sym,
-                                            selected = false,
-                                            onClick = { viewModel.addVideoSticker(sym) }
-                                        )
+                                    runCatching {
+                                        viewModel.setListeningCaptions(true)
+                                        speechCaptionLauncher.launch(intent)
+                                    }.onFailure {
+                                        viewModel.setListeningCaptions(false)
+                                        viewModel.addVideoText("Tap to edit caption", isCaption = true)
+                                        canvasSelection = CanvasSelectionTarget.TEXT
+                                        viewModel.showToast("Caption added — tap to edit")
                                     }
+                                },
+                                onSelectText = { id ->
+                                    viewModel.selectVideoText(id)
+                                    canvasSelection = CanvasSelectionTarget.TEXT
+                                },
+                                onUpdateSelectedText = { transform ->
+                                    viewModel.updateSelectedVideoText(transform)
+                                },
+                                onDuplicateText = { id ->
+                                    viewModel.duplicateVideoText(id)
+                                    canvasSelection = CanvasSelectionTarget.TEXT
+                                },
+                                onDeleteText = { id ->
+                                    canvasSelection = CanvasSelectionTarget.NONE
+                                    viewModel.deleteVideoText(id)
                                 }
-                            }
+                            )
+                        }
 
-                            // Multi-layer selector chips
-                            if (state.textLayers.size > 1) {
-                                Row(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .horizontalScroll(rememberScrollState()),
-                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                                ) {
-                                    state.textLayers.forEach { layer ->
-                                        StudioChipButton(
-                                            text = layer.text.take(12),
-                                            selected = layer.id == state.selectedTextId,
-                                            onClick = { viewModel.selectVideoText(layer.id) }
-                                        )
-                                    }
-                                }
-                            }
-
-                            val selText = state.textLayers.firstOrNull { it.id == state.selectedTextId }
-                            if (selText != null) {
-                                Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                                ) {
-                                    OutlinedTextField(
-                                        value = selText.text,
-                                        onValueChange = { txt -> viewModel.updateSelectedVideoText { it.copy(text = txt) } },
-                                        placeholder = { Text("Enter text") },
-                                        singleLine = true,
-                                        colors = OutlinedTextFieldDefaults.colors(
-                                            focusedBorderColor = ElectricCyan,
-                                            unfocusedBorderColor = StudioBorder,
-                                            focusedTextColor = TextPrimary,
-                                            unfocusedTextColor = TextPrimary
-                                        ),
-                                        modifier = Modifier.weight(1f)
+                        VideoToolTab.STICKER -> {
+                            ProStickerEditingToolbar(
+                                stickerLayers = state.textLayers.filter { it.isSticker },
+                                selectedTextId = state.selectedTextId,
+                                isCropping = isStickerCropping,
+                                onAddCatalogSticker = { item ->
+                                    viewModel.addCatalogSticker(item)
+                                    canvasSelection = CanvasSelectionTarget.STICKER
+                                    isStickerCropping = false
+                                },
+                                onImportCustomImageSticker = {
+                                    stickerImagePicker.launch(
+                                        PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
                                     )
-                                    IconButton(onClick = { viewModel.deleteSelectedVideoText() }) {
-                                        Icon(Icons.Default.Delete, contentDescription = "Delete Text", tint = SignalRed)
+                                },
+                                onSelectSticker = { id ->
+                                    viewModel.selectVideoText(id)
+                                    canvasSelection = CanvasSelectionTarget.STICKER
+                                    isStickerCropping = false
+                                },
+                                onUpdateSelectedSticker = { transform ->
+                                    viewModel.updateSelectedVideoText(transform)
+                                },
+                                onStartCropMode = {
+                                    if (selectedOverlayLayer?.isSticker == true) {
+                                        canvasSelection = CanvasSelectionTarget.STICKER
+                                        isStickerCropping = !isStickerCropping
                                     }
+                                },
+                                onDuplicateSticker = { id ->
+                                    viewModel.duplicateVideoText(id)
+                                    canvasSelection = CanvasSelectionTarget.STICKER
+                                    isStickerCropping = false
+                                },
+                                onDeleteSticker = { id ->
+                                    isStickerCropping = false
+                                    canvasSelection = CanvasSelectionTarget.NONE
+                                    viewModel.deleteVideoText(id)
                                 }
-
-                                Row(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .horizontalScroll(rememberScrollState()),
-                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                                ) {
-                                    VideoTextControl.entries.forEach { ctrl ->
-                                        StudioChipButton(
-                                            text = ctrl.label,
-                                            selected = textControl == ctrl,
-                                            onClick = { textControl = ctrl }
-                                        )
-                                    }
-                                }
-
-                                when (textControl) {
-                                    VideoTextControl.FONT -> Row(
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .horizontalScroll(rememberScrollState()),
-                                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                                    ) {
-                                        StudioFonts.all.forEach { f ->
-                                            StudioChipButton(
-                                                text = f.displayName,
-                                                selected = selText.fontId == f.id,
-                                                onClick = { viewModel.updateSelectedVideoText { it.copy(fontId = f.id) } }
-                                            )
-                                        }
-                                    }
-
-                                    VideoTextControl.STYLE -> Row(
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .horizontalScroll(rememberScrollState()),
-                                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                                    ) {
-                                        TextAnimationStyle.entries.forEach { anim ->
-                                            StudioChipButton(
-                                                text = anim.label,
-                                                selected = selText.animation == anim,
-                                                onClick = { viewModel.updateSelectedVideoText { it.copy(animation = anim) } }
-                                            )
-                                        }
-                                    }
-
-                                    VideoTextControl.COLOR -> StudioColorSwatchRow(selText.colorArgb, { c ->
-                                        viewModel.updateSelectedVideoText { it.copy(colorArgb = c) }
-                                    })
-
-                                    VideoTextControl.BG_STYLE -> {
-                                        Row(
-                                            modifier = Modifier.fillMaxWidth(),
-                                            horizontalArrangement = Arrangement.SpaceBetween,
-                                            verticalAlignment = Alignment.CenterVertically
-                                        ) {
-                                            Text("Background Box & Shadow", style = MaterialTheme.typography.bodySmall, color = TextPrimary)
-                                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                                Switch(
-                                                    checked = selText.bgEnabled,
-                                                    onCheckedChange = { b -> viewModel.updateSelectedVideoText { it.copy(bgEnabled = b) } },
-                                                    colors = SwitchDefaults.colors(checkedThumbColor = Color.White, checkedTrackColor = ElectricCyan)
-                                                )
-                                                Switch(
-                                                    checked = selText.shadowEnabled,
-                                                    onCheckedChange = { sh -> viewModel.updateSelectedVideoText { it.copy(shadowEnabled = sh) } },
-                                                    colors = SwitchDefaults.colors(checkedThumbColor = Color.White, checkedTrackColor = NeonViolet)
-                                                )
-                                            }
-                                        }
-                                        StudioSliderRow("Outline", selText.strokeWidth, 0f..16f, "${selText.strokeWidth.roundToInt()}") { w ->
-                                            viewModel.updateSelectedVideoText { it.copy(strokeWidth = w) }
-                                        }
-                                    }
-
-                                    VideoTextControl.SIZE -> StudioSliderRow("Text Size", selText.scale, 0.5f..2.2f, "${(selText.scale * 100).roundToInt()}%") { sc ->
-                                        viewModel.updateSelectedVideoText { it.copy(scale = sc) }
-                                    }
-
-                                    VideoTextControl.POSITION -> StudioSliderRow("Up / Down", selText.yNorm, 0.1f..0.92f, "${(selText.yNorm * 100).roundToInt()}%") { y ->
-                                        viewModel.updateSelectedVideoText { it.copy(yNorm = y) }
-                                    }
-                                }
-                            }
+                            )
                         }
 
                         VideoToolTab.EXPORT -> {
@@ -3159,7 +3665,35 @@ fun VideoEditorWorkspace(
                                 isToolDrawerExpanded = true
                             }
                             VideoToolTab.DELETE -> {
-                                viewModel.deleteSelectedClip()
+                                when {
+                                    canvasSelection == CanvasSelectionTarget.PIP && hasActiveUserPip -> {
+                                        canvasSelection = CanvasSelectionTarget.NONE
+                                        viewModel.removePipOverlay()
+                                    }
+                                    state.selectedTextId != null -> {
+                                        val delId = state.selectedTextId
+                                        isStickerCropping = false
+                                        if (canvasSelection == CanvasSelectionTarget.TEXT || canvasSelection == CanvasSelectionTarget.STICKER) {
+                                            canvasSelection = CanvasSelectionTarget.NONE
+                                        }
+                                        viewModel.deleteVideoText(delId)
+                                    }
+                                    state.selectedAudioClipId != null -> {
+                                        viewModel.deleteVideoAudioClip(state.selectedAudioClipId)
+                                    }
+                                    state.selectedClipId != null -> {
+                                        viewModel.deleteVideoClipById(state.selectedClipId)
+                                    }
+                                    state.clips.isNotEmpty() -> {
+                                        viewModel.deleteSelectedClip()
+                                    }
+                                    state.audioLaneClips.isNotEmpty() -> {
+                                        viewModel.deleteSelectedVideoAudioClip()
+                                    }
+                                    state.textLayers.isNotEmpty() -> {
+                                        viewModel.deleteSelectedVideoText()
+                                    }
+                                }
                                 isClipQuickBarVisible = false
                             }
                             VideoToolTab.NONE -> Unit

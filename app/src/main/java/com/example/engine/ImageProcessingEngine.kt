@@ -1442,9 +1442,26 @@ object ImageProcessingEngine {
      * Stabilization, Motion Blur, Keyframes, HSL Grading, Quality Enhancer, PIP Blend Modes + Shape Masking,
      * Visual Transitions, Text Background Pills, Stickers, and Auto-Captions.
      */
+    /**
+     * Clamps a frame center coordinate along one axis so:
+     * - When the scaled frame is smaller than the viewport, it stays completely inside [drawDim/2, viewportDim - drawDim/2].
+     * - When the scaled frame is larger than the viewport, it covers the viewport without leaving awkward off-center gaps.
+     */
+    fun clampFrameCenter(rawCenter: Float, drawDim: Float, viewportDim: Float): Float {
+        if (!rawCenter.isFinite() || !drawDim.isFinite() || !viewportDim.isFinite() || viewportDim <= 0f) {
+            return viewportDim / 2f
+        }
+        val half = drawDim / 2f
+        return if (drawDim <= viewportDim) {
+            rawCenter.coerceIn(half, (viewportDim - half).coerceAtLeast(half))
+        } else {
+            rawCenter.coerceIn((viewportDim - half).coerceAtMost(half), half)
+        }
+    }
+
     fun renderVideoFrame(
         context: Context,
-        sourceFrame: Bitmap,
+        sourceFrame: Bitmap?,
         targetW: Int,
         targetH: Int,
         cropZoom: Float,
@@ -1491,95 +1508,124 @@ object ImageProcessingEngine {
         previousFrame: Bitmap? = null
     ): Bitmap {
         val output = Bitmap.createBitmap(targetW, targetH, Bitmap.Config.ARGB_8888)
+        output.eraseColor(Color.BLACK)
         val canvas = Canvas(output)
+        // Always start from clean pure black (#000000) so empty gaps / low opacity NEVER flash white
         canvas.drawColor(Color.BLACK)
 
-        // 1. Background Fill (Blur / Solid Color / Custom Image)
-        when (bgFillMode) {
-            VideoBgFillMode.BLUR -> {
-                if (blurredBgFill) {
-                    val blurSmall = Bitmap.createScaledBitmap(sourceFrame, 120, 68, true)
-                    val blurred = fastBoxBlur(blurSmall, 10)
-                    blurSmall.recycle()
-                    val bgScale = max(targetW.toFloat() / blurred.width, targetH.toFloat() / blurred.height)
-                    val bw = blurred.width * bgScale
-                    val bh = blurred.height * bgScale
-                    val bgPaint = Paint(Paint.FILTER_BITMAP_FLAG).apply { alpha = 195 }
-                    canvas.drawBitmap(
-                        blurred,
-                        null,
-                        RectF((targetW - bw) / 2f, (targetH - bh) / 2f, (targetW + bw) / 2f, (targetH + bh) / 2f),
-                        bgPaint
-                    )
-                    blurred.recycle()
-                }
-            }
-            VideoBgFillMode.COLOR -> canvas.drawColor(bgFillColorArgb)
-            VideoBgFillMode.IMAGE -> {
-                val bgBmp = decodeSampledBitmap(context, bgImageUri, null, max(targetW, targetH))
-                if (bgBmp != null) {
-                    val bgScale = max(targetW.toFloat() / bgBmp.width, targetH.toFloat() / bgBmp.height)
-                    val bw = bgBmp.width * bgScale
-                    val bh = bgBmp.height * bgScale
-                    canvas.drawBitmap(
-                        bgBmp,
-                        null,
-                        RectF((targetW - bw) / 2f, (targetH - bh) / 2f, (targetW + bw) / 2f, (targetH + bh) / 2f),
-                        Paint(Paint.FILTER_BITMAP_FLAG)
-                    )
-                } else {
-                    canvas.drawColor(bgFillColorArgb)
-                }
-            }
-        }
-
-        // 1b. Optional Outgoing Clip Backdrop during Multi-Clip Transitions
-        if (previousFrame != null && !previousFrame.isRecycled) {
-            val prevFit = min(targetW.toFloat() / previousFrame.width, targetH.toFloat() / previousFrame.height)
-            val prevScale = prevFit * cropZoom.coerceIn(0.25f, 3.0f)
-            val prevW = previousFrame.width * prevScale
-            val prevH = previousFrame.height * prevScale
-            val prevCx = targetW / 2f + panX * targetW * 0.4f
-            val prevCy = targetH / 2f + panY * targetH * 0.4f
-            canvas.drawBitmap(
-                previousFrame,
-                null,
-                RectF(prevCx - prevW / 2f, prevCy - prevH / 2f, prevCx + prevW / 2f, prevCy + prevH / 2f),
-                Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
-            )
-        }
-
-        // 2. Main Framed Video with HSL + ColorMatrix + LUT + Keyframes + Clip Transforms
-        val cm = buildColorMatrix(
-            brightness = (grade.brightness + grade.hslLight).coerceIn(-1f, 1f),
-            contrast = grade.contrast,
-            saturation = (grade.saturation + grade.hslSat).coerceIn(0f, 2.5f),
-            exposure = grade.exposure,
-            warmth = grade.temperature,
-            hueDeg = grade.hslHue,
-            lut = grade.lut,
-            lutIntensity = grade.filterIntensity
-        )
         val combinedAlpha = (transitionAlpha * keyframeOpacity).coerceIn(0f, 1f)
-        val mainPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG).apply {
-            colorFilter = ColorMatrixColorFilter(cm)
-            alpha = (combinedAlpha * 255f).roundToInt()
-        }
 
-        val stabilizeBoost = if (stabilizeEnabled) 1.09f else 1f
-        val baseFit = min(targetW.toFloat() / sourceFrame.width, targetH.toFloat() / sourceFrame.height)
-        val effScale = baseFit * cropZoom.coerceIn(0.25f, 3.0f) * transitionScale * keyframeScale * stabilizeBoost
-        val drawW = sourceFrame.width * effScale
-        val drawH = sourceFrame.height * effScale
-        val cx = targetW / 2f + (panX + keyframeX) * targetW * 0.4f + transitionOffsetX * targetW
-        val cy = targetH / 2f + (panY + keyframeY) * targetH * 0.4f + transitionOffsetY * targetH
+        if (sourceFrame != null && !sourceFrame.isRecycled) {
+            // 1. Background Fill (Blur / Solid Color / Custom Image) scaled smoothly by clip opacity
+            when (bgFillMode) {
+                VideoBgFillMode.BLUR -> {
+                    if (blurredBgFill && combinedAlpha > 0.01f) {
+                        val blurSmall = Bitmap.createScaledBitmap(sourceFrame, 120, 68, true)
+                        val blurred = fastBoxBlur(blurSmall, 10)
+                        blurSmall.recycle()
+                        val bgScale = max(targetW.toFloat() / blurred.width, targetH.toFloat() / blurred.height)
+                        val bw = blurred.width * bgScale
+                        val bh = blurred.height * bgScale
+                        val bgPaint = Paint(Paint.FILTER_BITMAP_FLAG).apply {
+                            alpha = (195f * combinedAlpha).roundToInt().coerceIn(0, 255)
+                        }
+                        canvas.drawBitmap(
+                            blurred,
+                            null,
+                            RectF((targetW - bw) / 2f, (targetH - bh) / 2f, (targetW + bw) / 2f, (targetH + bh) / 2f),
+                            bgPaint
+                        )
+                        blurred.recycle()
+                    }
+                }
+                VideoBgFillMode.COLOR -> {
+                    if (bgFillColorArgb != Color.BLACK && combinedAlpha > 0.01f) {
+                        val bgPaint = Paint().apply {
+                            color = bgFillColorArgb
+                            alpha = (Color.alpha(bgFillColorArgb) * combinedAlpha).roundToInt().coerceIn(0, 255)
+                        }
+                        canvas.drawRect(0f, 0f, targetW.toFloat(), targetH.toFloat(), bgPaint)
+                    }
+                }
+                VideoBgFillMode.IMAGE -> {
+                    val bgBmp = decodeSampledBitmap(context, bgImageUri, null, max(targetW, targetH))
+                    if (bgBmp != null && combinedAlpha > 0.01f) {
+                        val bgScale = max(targetW.toFloat() / bgBmp.width, targetH.toFloat() / bgBmp.height)
+                        val bw = bgBmp.width * bgScale
+                        val bh = bgBmp.height * bgScale
+                        val bgPaint = Paint(Paint.FILTER_BITMAP_FLAG).apply {
+                            alpha = (255f * combinedAlpha).roundToInt().coerceIn(0, 255)
+                        }
+                        canvas.drawBitmap(
+                            bgBmp,
+                            null,
+                            RectF((targetW - bw) / 2f, (targetH - bh) / 2f, (targetW + bw) / 2f, (targetH + bh) / 2f),
+                            bgPaint
+                        )
+                    }
+                }
+            }
 
-        val combinedBlur = max(grade.blur, transitionBlurAmount)
-        var processedSource = if (combinedBlur > 0.04f) {
-            fastBoxBlur(sourceFrame, (combinedBlur * 14f).roundToInt())
-        } else {
-            sourceFrame
-        }
+            // 1b. Optional Outgoing Clip Backdrop during Multi-Clip Transitions
+            if (previousFrame != null && !previousFrame.isRecycled) {
+                val prevFit = min(targetW.toFloat() / previousFrame.width, targetH.toFloat() / previousFrame.height)
+                val prevScale = prevFit * cropZoom.coerceIn(0.25f, 3.0f)
+                val prevW = previousFrame.width * prevScale
+                val prevH = previousFrame.height * prevScale
+                val prevCx = clampFrameCenter(targetW / 2f + panX * targetW * 0.4f, prevW, targetW.toFloat())
+                val prevCy = clampFrameCenter(targetH / 2f + panY * targetH * 0.4f, prevH, targetH.toFloat())
+                canvas.drawBitmap(
+                    previousFrame,
+                    null,
+                    RectF(prevCx - prevW / 2f, prevCy - prevH / 2f, prevCx + prevW / 2f, prevCy + prevH / 2f),
+                    Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+                )
+            }
+
+            // 2. Main Framed Video with HSL + ColorMatrix + LUT + Keyframes + Clip Transforms
+            if (combinedAlpha > 0.005f) {
+                val cm = buildColorMatrix(
+                    brightness = (grade.brightness + grade.hslLight).coerceIn(-1f, 1f),
+                    contrast = grade.contrast,
+                    saturation = (grade.saturation + grade.hslSat).coerceIn(0f, 2.5f),
+                    exposure = grade.exposure,
+                    warmth = grade.temperature,
+                    hueDeg = grade.hslHue,
+                    lut = grade.lut,
+                    lutIntensity = grade.filterIntensity
+                )
+                val mainPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG).apply {
+                    colorFilter = ColorMatrixColorFilter(cm)
+                    alpha = (combinedAlpha * 255f).roundToInt().coerceIn(0, 255)
+                }
+
+                val stabilizeBoost = if (stabilizeEnabled) 1.09f else 1f
+                val baseFit = min(targetW.toFloat() / sourceFrame.width, targetH.toFloat() / sourceFrame.height)
+                val baseScale = baseFit * cropZoom.coerceIn(0.25f, 3.0f) * keyframeScale.coerceIn(0.2f, 3.0f) * stabilizeBoost
+                val baseDrawW = sourceFrame.width * baseScale
+                val baseDrawH = sourceFrame.height * baseScale
+                val clampedBaseCx = clampFrameCenter(
+                    targetW / 2f + (panX + keyframeX) * targetW * 0.4f,
+                    baseDrawW,
+                    targetW.toFloat()
+                )
+                val clampedBaseCy = clampFrameCenter(
+                    targetH / 2f + (panY + keyframeY) * targetH * 0.4f,
+                    baseDrawH,
+                    targetH.toFloat()
+                )
+
+                val drawW = baseDrawW * transitionScale
+                val drawH = baseDrawH * transitionScale
+                val cx = clampedBaseCx + transitionOffsetX * targetW
+                val cy = clampedBaseCy + transitionOffsetY * targetH
+
+                val combinedBlur = max(grade.blur, transitionBlurAmount)
+                var processedSource = if (combinedBlur > 0.04f) {
+                    fastBoxBlur(sourceFrame, (combinedBlur * 14f).roundToInt())
+                } else {
+                    sourceFrame
+                }
         if (grade.sharpen > 0.04f) {
             val sharpened = applyFineLightroomPass(
                 bitmap = processedSource,
@@ -1674,16 +1720,19 @@ object ImageProcessingEngine {
             canvas.drawBitmap(processedSource, null, RectF(-drawW / 2f - shift, -drawH / 2f, drawW / 2f - shift, drawH / 2f), rPaint)
             canvas.drawBitmap(processedSource, null, RectF(-drawW / 2f + shift, -drawH / 2f, drawW / 2f + shift, drawH / 2f), cPaint)
         }
-        canvas.restore()
+                canvas.restore()
 
-        if (processedSource != sourceFrame) processedSource.recycle()
+                if (processedSource != sourceFrame) processedSource.recycle()
+            }
+        }
 
-        // 3. PIP Overlay with Blend Mode, Shape Masking, Opacity & Rotation
+        // 3. PIP Overlay with Blend Mode, Shape Masking, Opacity & Rotation (clamped cleanly inside viewport)
         if (pipBitmap != null && !pipBitmap.isRecycled) {
-            val pipW = targetW * pipScale.coerceIn(0.14f, 0.9f)
-            val pipH = pipW * (pipBitmap.height.toFloat() / pipBitmap.width.toFloat().coerceAtLeast(1f))
-            val px = pipXNorm * targetW
-            val py = pipYNorm * targetH
+            val pipW = (targetW * pipScale.coerceIn(0.14f, 0.9f)).coerceAtMost(targetW.toFloat())
+            val pipH = (pipW * (pipBitmap.height.toFloat() / pipBitmap.width.toFloat().coerceAtLeast(1f)))
+                .coerceAtMost(targetH.toFloat())
+            val px = clampFrameCenter(pipXNorm * targetW, pipW, targetW.toFloat())
+            val py = clampFrameCenter(pipYNorm * targetH, pipH, targetH.toFloat())
             val pipRect = RectF(-pipW / 2f, -pipH / 2f, pipW / 2f, pipH / 2f)
             val pipPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG).apply {
                 alpha = (pipOpacity.coerceIn(0.05f, 1f) * 255f).roundToInt()
@@ -1707,65 +1756,15 @@ object ImageProcessingEngine {
             canvas.drawColor(Color.argb(a, Color.red(flashOverlayColor), Color.green(flashOverlayColor), Color.blue(flashOverlayColor)))
         }
 
-        // 5. Animated Text, Background Pills, Stickers & Captions
-        for (txt in activeTexts) {
-            if (playheadMs !in txt.startMs..txt.endMs) continue
-            val elapsed = (playheadMs - txt.startMs).coerceAtLeast(0L)
-            val progress = (elapsed / 420f).coerceIn(0f, 1f)
-            var alpha = 1f
-            var yShift = 0f
-            var animScale = 1f
-            var shownText = txt.text
-            when (txt.animation) {
-                com.example.model.TextAnimationStyle.NONE -> Unit
-                com.example.model.TextAnimationStyle.FADE -> alpha = progress
-                com.example.model.TextAnimationStyle.POP -> animScale = 0.65f + 0.35f * sin(progress * PI / 2.0).toFloat()
-                com.example.model.TextAnimationStyle.SLIDE_UP -> {
-                    alpha = progress
-                    yShift = (1f - progress) * targetH * 0.08f
-                }
-                com.example.model.TextAnimationStyle.TYPEWRITER -> {
-                    val chars = (txt.text.length * ((elapsed / 1200f).coerceIn(0.15f, 1f))).roundToInt()
-                    shownText = txt.text.take(chars.coerceAtLeast(1))
-                }
-            }
-            val tf = StudioFonts.byId(txt.fontId).loadTypeface(context)
-            val baseRatio = if (txt.isSticker) 0.12f else 0.075f
-            val textSizePx = (min(targetW, targetH) * baseRatio * txt.scale * animScale).coerceIn(16f, targetW * 0.32f)
-            val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                typeface = tf
-                textSize = textSizePx
-                color = txt.colorArgb
-                textAlign = Paint.Align.CENTER
-                this.alpha = (alpha * 255f).roundToInt()
-                if (txt.shadowEnabled) {
-                    setShadowLayer(textSizePx * 0.16f, 0f, textSizePx * 0.08f, Color.argb(220, 0, 0, 0))
-                }
-            }
-            val strokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                typeface = tf
-                textSize = textSizePx
-                style = Paint.Style.STROKE
-                color = txt.strokeArgb
-                strokeWidth = (txt.strokeWidth * (targetW / 1080f)).coerceAtLeast(2f)
-                strokeJoin = Paint.Join.ROUND
-                textAlign = Paint.Align.CENTER
-                this.alpha = (alpha * 255f).roundToInt()
-            }
-            val tx = txt.xNorm * targetW
-            val ty = txt.yNorm * targetH + yShift
-            if (txt.isCaption || txt.bgEnabled) {
-                val boundsW = fillPaint.measureText(shownText) + textSizePx * 0.9f
-                val pillRect = RectF(tx - boundsW / 2f, ty - textSizePx * 0.95f, tx + boundsW / 2f, ty + textSizePx * 0.32f)
-                val pillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                    val c = if (txt.bgEnabled) txt.bgColorArgb else Color.argb(195, 10, 7, 15)
-                    color = Color.argb((alpha * Color.alpha(c)).roundToInt(), Color.red(c), Color.green(c), Color.blue(c))
-                }
-                canvas.drawRoundRect(pillRect, 16f, 16f, pillPaint)
-            }
-            if (!txt.isSticker && txt.strokeWidth > 0.5f) canvas.drawText(shownText, tx, ty, strokePaint)
-            canvas.drawText(shownText, tx, ty, fillPaint)
-        }
+        // 5. Pro Animated Text, Background Pills, Vector/Emoji/Photo Stickers & Captions
+        VideoOverlayRenderer.drawOverlays(
+            context = context,
+            canvas = canvas,
+            activeTexts = activeTexts,
+            playheadMs = playheadMs,
+            targetW = targetW,
+            targetH = targetH
+        )
 
         return output
     }

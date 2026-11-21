@@ -33,6 +33,14 @@ data class StudioFontOption(
 }
 
 object StudioFonts {
+    val proVideoPresets: List<StudioFontOption> = listOf(
+        StudioFontOption("bold_sans", "Bold Sans", "Pro", R.font.oswald, FontFamily(Font(R.font.oswald))),
+        StudioFontOption("cinematic_serif", "Cinematic Serif", "Pro", R.font.cinzel, FontFamily(Font(R.font.cinzel))),
+        StudioFontOption("neon_mono", "Neon Mono", "Pro", R.font.jetbrains_mono, JetBrainsMonoFamily),
+        StudioFontOption("street_script", "Street Script", "Pro", R.font.permanent_marker, FontFamily(Font(R.font.permanent_marker))),
+        StudioFontOption("impact_display", "Impact Display", "Pro", R.font.anton, FontFamily(Font(R.font.anton)))
+    )
+
     val all: List<StudioFontOption> = listOf(
         StudioFontOption("bangers", "Bangers", "Gaming", R.font.bangers, FontFamily(Font(R.font.bangers))),
         StudioFontOption("anton", "Anton", "Thumbnail", R.font.anton, FontFamily(Font(R.font.anton))),
@@ -50,7 +58,10 @@ object StudioFonts {
         StudioFontOption("jetbrains_mono", "Code Mono", "HUD", R.font.jetbrains_mono, JetBrainsMonoFamily)
     )
 
-    fun byId(id: String): StudioFontOption = all.firstOrNull { it.id == id } ?: all.first()
+    fun byId(id: String): StudioFontOption =
+        proVideoPresets.firstOrNull { it.id == id }
+            ?: all.firstOrNull { it.id == id }
+            ?: all.first()
 }
 
 val XonixTypography = Typography(

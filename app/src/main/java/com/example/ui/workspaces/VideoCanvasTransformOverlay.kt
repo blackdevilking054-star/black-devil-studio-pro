@@ -85,7 +85,9 @@ internal fun BoxScope.InteractiveWhiteTransformBox(
     onTapBox: () -> Unit = {},
     onDoubleTapBox: (() -> Unit)? = null,
     badgeHint: String? = null,
-    allowPinchRotate: Boolean = true
+    allowPinchRotate: Boolean = true,
+    viewportW: Int = Int.MAX_VALUE,
+    viewportH: Int = Int.MAX_VALUE
 ) {
     val density = LocalDensity.current
     val currentOnScale by rememberUpdatedState(onCornerScaleDelta)
@@ -97,17 +99,31 @@ internal fun BoxScope.InteractiveWhiteTransformBox(
     val currentRotDeg by rememberUpdatedState(rotationDeg)
     val currentAllowPinchRotate by rememberUpdatedState(allowPinchRotate)
 
-    val handleTopExtraPx = with(density) { 56.dp.roundToPx() }
-    val handlePadPx = with(density) { 22.dp.roundToPx() }
+    val boundedToViewport = viewportW < Int.MAX_VALUE && viewportH < Int.MAX_VALUE
+    val clampedW = if (boundedToViewport) boxW.coerceIn(36, viewportW.coerceAtLeast(36)) else boxW
+    val clampedH = if (boundedToViewport) boxH.coerceIn(36, viewportH.coerceAtLeast(36)) else boxH
+    val clampedLeft = if (boundedToViewport) leftPx.coerceIn(0, (viewportW - clampedW).coerceAtLeast(0)) else leftPx
+    val clampedTop = if (boundedToViewport) topPx.coerceIn(0, (viewportH - clampedH).coerceAtLeast(0)) else topPx
 
-    val totalW = boxW + handlePadPx * 2
-    val totalH = boxH + handleTopExtraPx + handlePadPx
-    val boxCenterYNorm = (handleTopExtraPx + boxH / 2f) / totalH.coerceAtLeast(1).toFloat()
+    val desiredTopStemPx = with(density) { 46.dp.roundToPx() }
+    val placeRotateInside = boundedToViewport && clampedTop < desiredTopStemPx
+    val handleTopExtraPx = if (placeRotateInside) 0 else desiredTopStemPx
+    val handlePadPx = if (boundedToViewport) 0 else with(density) { 22.dp.roundToPx() }
+
+    val totalW = clampedW + handlePadPx * 2
+    val totalH = clampedH + handleTopExtraPx + handlePadPx
+    val boxCenterYNorm = (handleTopExtraPx + clampedH / 2f) / totalH.coerceAtLeast(1).toFloat()
+
+    // Keep handles flush along the exact white bounding box border without clipping outside viewport
+    val cornerInsetDp = if (boundedToViewport) (-6).dp else (-17).dp
+    val cornerOutsetDp = if (boundedToViewport) 6.dp else 17.dp
+    val sideInsetDp = if (boundedToViewport) (-6).dp else (-14).dp
+    val sideOutsetDp = if (boundedToViewport) 6.dp else 14.dp
 
     Box(
         modifier = Modifier
             .align(Alignment.TopStart)
-            .offset { IntOffset(leftPx - handlePadPx, topPx - handleTopExtraPx) }
+            .offset { IntOffset(clampedLeft - handlePadPx, clampedTop - handleTopExtraPx) }
             .size(
                 width = with(density) { totalW.toDp() },
                 height = with(density) { totalH.toDp() }
@@ -119,60 +135,96 @@ internal fun BoxScope.InteractiveWhiteTransformBox(
             .zIndex(8f)
             .testTag("${tagPrefix}_transform_box")
     ) {
-        // Dedicated Top 1-Finger Circular Rotation Handle + Stem (clearly separated above top edge resize handle)
-        Column(
-            modifier = Modifier
-                .align(Alignment.TopCenter)
-                .zIndex(11f),
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            Box(
+        // Dedicated Top 1-Finger Circular Rotation Handle (moves cleanly inside top edge when near viewport ceiling)
+        if (!placeRotateInside) {
+            Column(
                 modifier = Modifier
-                    .size(32.dp)
-                    .pointerInput(tagPrefix) {
-                        detectDragGestures { change, dragAmount ->
-                            change.consume()
-                            currentOnRotate(dragAmount.x * 0.72f)
+                    .align(Alignment.TopCenter)
+                    .zIndex(11f),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(32.dp)
+                        .pointerInput(tagPrefix) {
+                            detectDragGestures { change, dragAmount ->
+                                change.consume()
+                                currentOnRotate(dragAmount.x * 0.72f)
+                            }
+                        }
+                        .testTag("${tagPrefix}_rotate_handle"),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Surface(
+                        shape = CircleShape,
+                        color = Color.White,
+                        border = BorderStroke(1.2.dp, OledBlack.copy(alpha = 0.75f)),
+                        shadowElevation = 3.dp,
+                        modifier = Modifier.size(26.dp)
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Filled.RotateRight,
+                                contentDescription = "Rotate Frame",
+                                tint = OledBlack,
+                                modifier = Modifier.size(16.dp)
+                            )
                         }
                     }
-                    .testTag("${tagPrefix}_rotate_handle"),
-                contentAlignment = Alignment.Center
-            ) {
-                Surface(
-                    shape = CircleShape,
-                    color = Color.White,
-                    border = BorderStroke(1.2.dp, OledBlack.copy(alpha = 0.75f)),
-                    shadowElevation = 3.dp,
-                    modifier = Modifier.size(26.dp)
-                ) {
-                    Box(contentAlignment = Alignment.Center) {
-                        Icon(
-                            imageVector = Icons.AutoMirrored.Filled.RotateRight,
-                            contentDescription = "Rotate Frame",
-                            tint = OledBlack,
-                            modifier = Modifier.size(16.dp)
-                        )
-                    }
                 }
+                Box(
+                    modifier = Modifier
+                        .width(1.6.dp)
+                        .height(20.dp)
+                        .background(Color.White)
+                )
             }
-            Box(
-                modifier = Modifier
-                    .width(1.6.dp)
-                    .height(24.dp)
-                    .background(Color.White)
-            )
         }
 
         // Crisp White Bounding Box + Unified 1-Finger Drag / 2-Finger Pinch-Rotate / Double-Tap + 4 Corner & 4 Side Handles
         Box(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
-                .padding(bottom = 22.dp)
+                .padding(bottom = with(density) { handlePadPx.toDp() })
                 .size(
-                    width = with(density) { boxW.toDp() },
-                    height = with(density) { boxH.toDp() }
+                    width = with(density) { clampedW.toDp() },
+                    height = with(density) { clampedH.toDp() }
                 )
         ) {
+            if (placeRotateInside) {
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .padding(top = 12.dp)
+                        .size(32.dp)
+                        .zIndex(12f)
+                        .pointerInput("${tagPrefix}_inside_rot") {
+                            detectDragGestures { change, dragAmount ->
+                                change.consume()
+                                currentOnRotate(dragAmount.x * 0.72f)
+                            }
+                        }
+                        .testTag("${tagPrefix}_rotate_handle"),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Surface(
+                        shape = CircleShape,
+                        color = Color.White,
+                        border = BorderStroke(1.2.dp, OledBlack.copy(alpha = 0.75f)),
+                        shadowElevation = 3.dp,
+                        modifier = Modifier.size(26.dp)
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Filled.RotateRight,
+                                contentDescription = "Rotate Frame",
+                                tint = OledBlack,
+                                modifier = Modifier.size(16.dp)
+                            )
+                        }
+                    }
+                }
+            }
             // Interactive interior: 1-finger move, 2-finger pinch & rotate, single tap, double tap
             Box(
                 modifier = Modifier
@@ -325,57 +377,57 @@ internal fun BoxScope.InteractiveWhiteTransformBox(
                 }
             }
 
-            // Side Edge Resize Handles centered cleanly on exact Left, Right, Top, and Bottom outer edges
+            // Side Edge Resize Handles aligned cleanly along Left, Right, Top, and Bottom outer edges
             SideResizeHandle(
                 alignment = Alignment.CenterStart,
-                offsetX = (-14).dp,
+                offsetX = sideInsetDp,
                 offsetY = 0.dp,
                 isHorizontalBar = false,
                 signX = -1f,
                 signY = 0f,
-                edgeLengthPx = boxW.coerceAtLeast(64).toFloat(),
+                edgeLengthPx = clampedW.coerceAtLeast(64).toFloat(),
                 tag = "${tagPrefix}_side_left",
                 onScaleDelta = { currentOnScale(it) }
             )
             SideResizeHandle(
                 alignment = Alignment.CenterEnd,
-                offsetX = 14.dp,
+                offsetX = sideOutsetDp,
                 offsetY = 0.dp,
                 isHorizontalBar = false,
                 signX = 1f,
                 signY = 0f,
-                edgeLengthPx = boxW.coerceAtLeast(64).toFloat(),
+                edgeLengthPx = clampedW.coerceAtLeast(64).toFloat(),
                 tag = "${tagPrefix}_side_right",
                 onScaleDelta = { currentOnScale(it) }
             )
             SideResizeHandle(
                 alignment = Alignment.TopCenter,
                 offsetX = 0.dp,
-                offsetY = (-14).dp,
+                offsetY = sideInsetDp,
                 isHorizontalBar = true,
                 signX = 0f,
                 signY = -1f,
-                edgeLengthPx = boxH.coerceAtLeast(64).toFloat(),
+                edgeLengthPx = clampedH.coerceAtLeast(64).toFloat(),
                 tag = "${tagPrefix}_side_top",
                 onScaleDelta = { currentOnScale(it) }
             )
             SideResizeHandle(
                 alignment = Alignment.BottomCenter,
                 offsetX = 0.dp,
-                offsetY = 14.dp,
+                offsetY = sideOutsetDp,
                 isHorizontalBar = true,
                 signX = 0f,
                 signY = 1f,
-                edgeLengthPx = boxH.coerceAtLeast(64).toFloat(),
+                edgeLengthPx = clampedH.coerceAtLeast(64).toFloat(),
                 tag = "${tagPrefix}_side_bottom",
                 onScaleDelta = { currentOnScale(it) }
             )
 
-            // Corner 1: Top-Left Drag Resize Handle (centered dead-on exact outer vertex)
+            // Corner 1: Top-Left Drag Resize Handle
             CornerResizeHandle(
                 alignment = Alignment.TopStart,
-                offsetX = (-17).dp,
-                offsetY = (-17).dp,
+                offsetX = cornerInsetDp,
+                offsetY = cornerInsetDp,
                 signX = -1f,
                 signY = -1f,
                 minCanvasEdge = minCanvasEdge,
@@ -392,25 +444,28 @@ internal fun BoxScope.InteractiveWhiteTransformBox(
                     border = BorderStroke(1.5.dp, Color.White),
                     modifier = Modifier
                         .align(Alignment.TopEnd)
-                        .offset(x = 14.dp, y = (-14).dp)
-                        .size(28.dp)
-                        .zIndex(10f)
-                        .testTag("pip_overlay_delete_x_button")
+                        .offset(
+                            x = if (boundedToViewport) 4.dp else 14.dp,
+                            y = if (boundedToViewport) (-4).dp else (-14).dp
+                        )
+                        .size(26.dp)
+                        .zIndex(12f)
+                        .testTag(if (tagPrefix == "pip_canvas") "pip_overlay_delete_x_button" else "${tagPrefix}_delete_x_button")
                 ) {
                     Box(contentAlignment = Alignment.Center) {
                         Icon(
                             imageVector = Icons.Default.Close,
                             contentDescription = "Remove Overlay",
                             tint = Color.White,
-                            modifier = Modifier.size(16.dp)
+                            modifier = Modifier.size(15.dp)
                         )
                     }
                 }
             } else {
                 CornerResizeHandle(
                     alignment = Alignment.TopEnd,
-                    offsetX = 17.dp,
-                    offsetY = (-17).dp,
+                    offsetX = cornerOutsetDp,
+                    offsetY = cornerInsetDp,
                     signX = 1f,
                     signY = -1f,
                     minCanvasEdge = minCanvasEdge,
@@ -422,8 +477,8 @@ internal fun BoxScope.InteractiveWhiteTransformBox(
             // Corner 3: Bottom-Left Drag Resize Handle
             CornerResizeHandle(
                 alignment = Alignment.BottomStart,
-                offsetX = (-17).dp,
-                offsetY = 17.dp,
+                offsetX = cornerInsetDp,
+                offsetY = cornerOutsetDp,
                 signX = -1f,
                 signY = 1f,
                 minCanvasEdge = minCanvasEdge,
@@ -434,8 +489,8 @@ internal fun BoxScope.InteractiveWhiteTransformBox(
             // Corner 4: Bottom-Right Drag Resize Handle
             CornerResizeHandle(
                 alignment = Alignment.BottomEnd,
-                offsetX = 17.dp,
-                offsetY = 17.dp,
+                offsetX = cornerOutsetDp,
+                offsetY = cornerOutsetDp,
                 signX = 1f,
                 signY = 1f,
                 minCanvasEdge = minCanvasEdge,

@@ -200,18 +200,27 @@ object VideoMediaEngine {
     }
 
     /**
-     * Smoothly interpolates Diamond Keyframe transforms across a clip's local playhead.
+     * Smoothly interpolates Diamond Keyframe transforms across a clip's local playhead
+     * using cubic ease-in-out (smoothstep) with clamped finite values.
      */
     fun interpolateKeyframes(keyframes: List<VideoKeyframe>, localClipMs: Long): InterpolatedKeyframe {
         if (keyframes.isEmpty()) return InterpolatedKeyframe()
         val sorted = keyframes.sortedBy { it.timeMs }
+        fun sanitized(x: Float, y: Float, s: Float, r: Float, o: Float): InterpolatedKeyframe {
+            val safeX = if (x.isFinite()) x.coerceIn(-1f, 1f) else 0f
+            val safeY = if (y.isFinite()) y.coerceIn(-1f, 1f) else 0f
+            val safeS = if (s.isFinite()) s.coerceIn(0.2f, 3.0f) else 1f
+            val safeR = if (r.isFinite()) r else 0f
+            val safeO = if (o.isFinite()) o.coerceIn(0f, 1f) else 1f
+            return InterpolatedKeyframe(safeX, safeY, safeS, safeR, safeO)
+        }
         if (sorted.size == 1 || localClipMs <= sorted.first().timeMs) {
             val k = sorted.first()
-            return InterpolatedKeyframe(k.xNorm, k.yNorm, k.scale, k.rotationDeg, k.opacity)
+            return sanitized(k.xNorm, k.yNorm, k.scale, k.rotationDeg, k.opacity)
         }
         if (localClipMs >= sorted.last().timeMs) {
             val k = sorted.last()
-            return InterpolatedKeyframe(k.xNorm, k.yNorm, k.scale, k.rotationDeg, k.opacity)
+            return sanitized(k.xNorm, k.yNorm, k.scale, k.rotationDeg, k.opacity)
         }
         for (i in 0 until sorted.lastIndex) {
             val a = sorted[i]
@@ -219,12 +228,14 @@ object VideoMediaEngine {
             if (localClipMs in a.timeMs..b.timeMs) {
                 val span = (b.timeMs - a.timeMs).coerceAtLeast(1L).toFloat()
                 val t = ((localClipMs - a.timeMs) / span).coerceIn(0f, 1f)
-                return InterpolatedKeyframe(
-                    xNorm = a.xNorm + (b.xNorm - a.xNorm) * t,
-                    yNorm = a.yNorm + (b.yNorm - a.yNorm) * t,
-                    scale = a.scale + (b.scale - a.scale) * t,
-                    rotationDeg = a.rotationDeg + (b.rotationDeg - a.rotationDeg) * t,
-                    opacity = a.opacity + (b.opacity - a.opacity) * t
+                // Smooth cubic Hermite ease-in-out for cinematic motion with zero flicker
+                val ease = t * t * (3f - 2f * t)
+                return sanitized(
+                    x = a.xNorm + (b.xNorm - a.xNorm) * ease,
+                    y = a.yNorm + (b.yNorm - a.yNorm) * ease,
+                    s = a.scale + (b.scale - a.scale) * ease,
+                    r = a.rotationDeg + (b.rotationDeg - a.rotationDeg) * ease,
+                    o = a.opacity + (b.opacity - a.opacity) * ease
                 )
             }
         }
@@ -416,11 +427,14 @@ object VideoMediaEngine {
         var flashAlpha = 0f
         var flashColor = Color.WHITE
 
+        // Smooth bell curve peaking at mid-transition (0 at p=0 and p=1) so start/end frames NEVER stick white
+        val flashBell = sin(p * PI).toFloat().coerceIn(0f, 1f)
+
         when (transition) {
             VideoTransition.NONE -> Unit
             VideoTransition.CROSSFADE -> tAlpha = 0.15f + 0.85f * eased
             VideoTransition.DIP_TO_BLACK -> tAlpha = eased
-            VideoTransition.DIP_TO_WHITE -> { flashColor = Color.WHITE; flashAlpha = inv * 0.92f }
+            VideoTransition.DIP_TO_WHITE -> { flashColor = Color.WHITE; flashAlpha = flashBell * 0.85f }
             VideoTransition.WIPE_LEFT -> { tWipeProgress = eased.coerceAtLeast(0.03f); tWipeVertical = false }
             VideoTransition.WIPE_RIGHT -> { tWipeProgress = eased.coerceAtLeast(0.03f); tWipeVertical = false; tOffsetX = -inv * 0.25f }
             VideoTransition.WIPE_UP -> { tWipeProgress = eased.coerceAtLeast(0.03f); tWipeVertical = true }
@@ -487,12 +501,12 @@ object VideoMediaEngine {
             VideoTransition.CURTAIN_OPEN -> { tSplitProgress = eased.coerceAtLeast(0.03f); tAlpha = 0.4f + 0.6f * eased }
             VideoTransition.SHUTTER_SPLIT -> { tSplitProgress = eased.coerceAtLeast(0.03f); tBlur = inv * 0.4f; flashColor = Color.BLACK; flashAlpha = inv * 0.25f }
 
-            VideoTransition.FLASH -> { flashColor = Color.WHITE; flashAlpha = inv * 0.95f }
+            VideoTransition.FLASH -> { flashColor = Color.WHITE; flashAlpha = flashBell * 0.88f }
             VideoTransition.BLUR -> tBlur = inv * 0.95f
-            VideoTransition.LIGHT_LEAK -> { flashColor = Color.rgb(255, 165, 55); flashAlpha = inv * 0.78f }
-            VideoTransition.GLOW_BURN -> { flashColor = Color.rgb(255, 30, 66); flashAlpha = inv * 0.72f; tScale = 1.0f + inv * 0.16f }
-            VideoTransition.RADIAL_FLASH -> { flashColor = Color.rgb(255, 240, 190); flashAlpha = inv * 0.85f; tBlur = inv * 0.45f }
-            VideoTransition.CRIMSON_FLASH -> { flashColor = Color.rgb(255, 30, 66); flashAlpha = inv * 0.92f; tScale = 1.0f + inv * 0.10f }
+            VideoTransition.LIGHT_LEAK -> { flashColor = Color.rgb(255, 165, 55); flashAlpha = flashBell * 0.78f }
+            VideoTransition.GLOW_BURN -> { flashColor = Color.rgb(255, 30, 66); flashAlpha = flashBell * 0.72f; tScale = 1.0f + inv * 0.16f }
+            VideoTransition.RADIAL_FLASH -> { flashColor = Color.rgb(255, 240, 190); flashAlpha = flashBell * 0.82f; tBlur = inv * 0.45f }
+            VideoTransition.CRIMSON_FLASH -> { flashColor = Color.rgb(255, 30, 66); flashAlpha = flashBell * 0.88f; tScale = 1.0f + inv * 0.10f }
         }
 
         return TransitionFxValues(
@@ -528,10 +542,60 @@ object VideoMediaEngine {
         }
 
         val clips = state.clips
-        if (clips.isEmpty()) {
-            return Bitmap.createBitmap(targetW, targetH, Bitmap.Config.ARGB_8888).apply {
-                eraseColor(Color.rgb(8, 6, 12))
+        val totalClipsMs = clips.sumOf { it.effectiveDurationMs }
+
+        // Optional User-Added PIP bitmap ONLY (never draw any default stuck overlay)
+        var pipBmp: Bitmap? = null
+        var shouldRecyclePip = false
+        if (state.pip.enabled && !state.pip.uriString.isNullOrBlank()) {
+            val rawPip = ImageProcessingEngine.decodeSampledBitmap(
+                context = context,
+                uriString = state.pip.uriString,
+                fallbackDrawable = null,
+                maxDimension = (maxEdge * 0.55f).roundToInt().coerceAtLeast(180)
+            )
+            if (rawPip != null) {
+                if (state.pip.chromaEnabled) {
+                    pipBmp = ImageProcessingEngine.applyChromaKey(
+                        source = rawPip,
+                        keyColor = state.pip.chromaKeyColor,
+                        tolerance = state.pip.chromaTolerance,
+                        spillSuppression = state.pip.spillSuppression
+                    )
+                    shouldRecyclePip = true
+                } else {
+                    pipBmp = rawPip
+                }
             }
+        }
+
+        // Empty timeline or playhead past end of clips -> render clean pure black (#000000) canvas
+        if (clips.isEmpty() || (totalClipsMs > 0L && state.playheadMs > totalClipsMs)) {
+            val blackFrame = ImageProcessingEngine.renderVideoFrame(
+                context = context,
+                sourceFrame = null,
+                targetW = targetW,
+                targetH = targetH,
+                cropZoom = 1f,
+                panX = 0f,
+                panY = 0f,
+                blurredBgFill = false,
+                bgFillMode = com.example.model.VideoBgFillMode.COLOR,
+                bgFillColorArgb = Color.BLACK,
+                grade = state.colorGrade,
+                pipBitmap = pipBmp,
+                pipXNorm = state.pip.xNorm,
+                pipYNorm = state.pip.yNorm,
+                pipScale = state.pip.scale,
+                pipRotationDeg = state.pip.rotationDeg,
+                pipOpacity = state.pip.opacity,
+                pipBlendMode = state.pip.blendMode,
+                pipMaskShape = state.pip.maskShape,
+                activeTexts = state.textLayers,
+                playheadMs = state.playheadMs
+            )
+            if (shouldRecyclePip) pipBmp?.recycle()
+            return blackFrame
         }
 
         var cursor = 0L
@@ -599,10 +663,11 @@ object VideoMediaEngine {
                 }
             } else {
                 // 4. Single-clip or last-clip Motion/Whip/Spin/Zoom/Flash/Wipe FX animates live on intro & outro
-                if (localTimelineMs < activeFxDurMs) {
+                // Guard remainingMs > 0L so stopping at exact end of timeline never flashes
+                if (localTimelineMs > 0L && localTimelineMs < activeFxDurMs) {
                     val p = (localTimelineMs.toFloat() / activeFxDurMs.toFloat()).coerceIn(0f, 1f)
                     fx = computeTransitionFx(activeTr, p, localTimelineMs, continuousMode = false)
-                } else if (activeDurMs > activeFxDurMs * 2L && remainingMs < activeFxDurMs) {
+                } else if (activeDurMs > activeFxDurMs * 2L && remainingMs > 0L && remainingMs < activeFxDurMs) {
                     val p = (remainingMs.toFloat() / activeFxDurMs.toFloat()).coerceIn(0f, 1f)
                     val outro = computeTransitionFx(activeTr, p, localTimelineMs, continuousMode = false)
                     fx = outro.copy(
@@ -610,31 +675,6 @@ object VideoMediaEngine {
                         offsetY = -outro.offsetY,
                         rotation = -outro.rotation
                     )
-                }
-            }
-        }
-
-        // Optional User-Added PIP bitmap ONLY (never draw any default stuck overlay)
-        var pipBmp: Bitmap? = null
-        var shouldRecyclePip = false
-        if (state.pip.enabled && !state.pip.uriString.isNullOrBlank()) {
-            val rawPip = ImageProcessingEngine.decodeSampledBitmap(
-                context = context,
-                uriString = state.pip.uriString,
-                fallbackDrawable = null,
-                maxDimension = (maxEdge * 0.55f).roundToInt().coerceAtLeast(180)
-            )
-            if (rawPip != null) {
-                if (state.pip.chromaEnabled) {
-                    pipBmp = ImageProcessingEngine.applyChromaKey(
-                        source = rawPip,
-                        keyColor = state.pip.chromaKeyColor,
-                        tolerance = state.pip.chromaTolerance,
-                        spillSuppression = state.pip.spillSuppression
-                    )
-                    shouldRecyclePip = true
-                } else {
-                    pipBmp = rawPip
                 }
             }
         }

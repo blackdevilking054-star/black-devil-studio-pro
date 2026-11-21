@@ -182,10 +182,37 @@ enum class LutPreset(
 
 enum class TextAnimationStyle(val label: String) {
     NONE("None"),
-    FADE("Fade"),
-    POP("Pop"),
+    FADE("Fade In/Out"),
+    POP("Pop Scale"),
+    TYPEWRITER("Typewriter"),
     SLIDE_UP("Slide Up"),
-    TYPEWRITER("Type")
+    NEON_GLITCH("Neon Glitch")
+}
+
+enum class StickerAnimationStyle(val label: String) {
+    NONE("None"),
+    BOUNCE("Bounce"),
+    PULSE("Pulse"),
+    SPIN("Spin"),
+    FLOAT("Float"),
+    POP("Pop")
+}
+
+enum class StickerCropAspect(val label: String, val ratio: Float?) {
+    FREE("Free", null),
+    SQUARE_1_1("1:1", 1f),
+    WIDE_16_9("16:9", 16f / 9f),
+    TALL_9_16("9:16", 9f / 16f)
+}
+
+enum class StickerPackCategory(val label: String) {
+    BADGES("Neon Badges"),
+    ARROWS("Arrows"),
+    FIRE("Fire"),
+    STARS("Stars"),
+    SOCIAL("Subscribe/Like"),
+    EMOJIS("Emojis"),
+    FRAMES("Frames")
 }
 
 enum class VideoExportResolution(
@@ -341,7 +368,7 @@ data class PipOverlayState(
 data class VideoTextOverlay(
     val id: String,
     val text: String,
-    val fontId: String = "anton",
+    val fontId: String = "impact_display",
     val colorArgb: Int = 0xFFFFFFFF.toInt(),
     val strokeArgb: Int = 0xFF000000.toInt(),
     val strokeWidth: Float = 6f,
@@ -351,11 +378,23 @@ data class VideoTextOverlay(
     val xNorm: Float = 0.5f,
     val yNorm: Float = 0.80f,
     val scale: Float = 1.0f,
+    val rotationDeg: Float = 0f,
+    val opacity: Float = 1f,
     val startMs: Long = 0L,
     val endMs: Long = 4000L,
     val animation: TextAnimationStyle = TextAnimationStyle.POP,
+    val animationSpeed: Float = 1.0f,
     val isCaption: Boolean = false,
-    val isSticker: Boolean = false
+    val isSticker: Boolean = false,
+    val stickerImageUri: String? = null,
+    val stickerBadgeId: String? = null,
+    val stickerAnimation: StickerAnimationStyle = StickerAnimationStyle.NONE,
+    val flipH: Boolean = false,
+    val flipV: Boolean = false,
+    val cropLeft: Float = 0f,
+    val cropTop: Float = 0f,
+    val cropRight: Float = 1f,
+    val cropBottom: Float = 1f
 )
 
 data class VideoEditorState(
@@ -386,7 +425,7 @@ data class VideoEditorState(
     val exportFps: VideoExportFps = VideoExportFps.FPS_30
 ) {
     val totalDurationMs: Long
-        get() = clips.sumOf { it.effectiveDurationMs }.coerceAtLeast(1000L)
+        get() = if (clips.isEmpty()) 0L else clips.sumOf { it.effectiveDurationMs }.coerceAtLeast(250L)
 
     val selectedClip: VideoClip?
         get() = clips.firstOrNull { it.id == selectedClipId } ?: clips.firstOrNull()
