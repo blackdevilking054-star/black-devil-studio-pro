@@ -1,0 +1,9 @@
+<resources>
+    <string name="app_name">Black Devil Studio Pro</string>
+    <string name="nav_video">Video</string>
+    <string name="nav_photo">Photo</string>
+    <string name="nav_audio">Audio</string>
+    <string name="nav_vault">Vault</string>
+    <string name="action_export">Export</string>
+    <string name="action_save">Save</string>
+</resources>

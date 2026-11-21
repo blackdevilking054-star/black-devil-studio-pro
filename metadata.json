@@ -1,0 +1,6 @@
+{
+  "name": "Black Devil Studio Pro",
+  "description": "All-in-One Mobile Creator Studio featuring an A-to-Z Video Editor, Photo & Thumbnail Studio, Multi-Track Audio & SFX Mixer, and Quick Media Utilities with Auto-Save Project Vault.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
