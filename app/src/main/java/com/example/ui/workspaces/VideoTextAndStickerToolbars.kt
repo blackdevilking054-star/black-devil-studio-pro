@@ -57,6 +57,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.engine.StickerCatalogItem
+import com.example.engine.VideoOverlayRenderer
 import com.example.engine.VideoStickerCatalog
 import com.example.model.StickerAnimationStyle
 import com.example.model.StickerPackCategory
@@ -99,6 +100,7 @@ internal fun ProTextEditingToolbar(
     textLayers: List<VideoTextOverlay>,
     selectedTextId: String?,
     isListeningCaptions: Boolean,
+    playheadMs: Long? = null,
     onAddText: () -> Unit,
     onOpenStickersTab: () -> Unit,
     onLaunchAutoCaptions: () -> Unit,
@@ -109,8 +111,9 @@ internal fun ProTextEditingToolbar(
 ) {
     var activeSection by rememberSaveable { mutableStateOf(ProTextSection.FONT) }
     val onlyTextLayers = textLayers.filter { !it.isSticker }
-    val selText = onlyTextLayers.firstOrNull { it.id == selectedTextId }
+    val rawSelText = onlyTextLayers.firstOrNull { it.id == selectedTextId }
         ?: onlyTextLayers.firstOrNull()
+    val selText = rawSelText?.let { VideoOverlayRenderer.resolveOverlayTransformAt(it, playheadMs) }
 
     // Quick creation strip
     Row(
@@ -453,6 +456,7 @@ internal fun ProStickerEditingToolbar(
     stickerLayers: List<VideoTextOverlay>,
     selectedTextId: String?,
     isCropping: Boolean,
+    playheadMs: Long? = null,
     onAddCatalogSticker: (StickerCatalogItem) -> Unit,
     onImportCustomImageSticker: () -> Unit,
     onSelectSticker: (String) -> Unit,
@@ -461,7 +465,8 @@ internal fun ProStickerEditingToolbar(
     onDuplicateSticker: (String) -> Unit,
     onDeleteSticker: (String) -> Unit
 ) {
-    val selSticker = stickerLayers.firstOrNull { it.id == selectedTextId }
+    val rawSelSticker = stickerLayers.firstOrNull { it.id == selectedTextId }
+    val selSticker = rawSelSticker?.let { VideoOverlayRenderer.resolveOverlayTransformAt(it, playheadMs) }
     var activeSection by rememberSaveable(selSticker?.id) {
         mutableStateOf(if (selSticker != null) ProStickerSection.TRANSFORM else ProStickerSection.PICKER)
     }

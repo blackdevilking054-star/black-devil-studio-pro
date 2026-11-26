@@ -141,6 +141,27 @@ object VideoOverlayRenderer {
     }
 
     /**
+     * Resolves a Text or Sticker overlay's active transform at [playheadMs] using its Keyframe list
+     * when present, or returns [layer] unchanged when it has no Keyframes.
+     */
+    fun resolveOverlayTransformAt(
+        layer: VideoTextOverlay,
+        playheadMs: Long?
+    ): VideoTextOverlay {
+        if (playheadMs == null || layer.keyframes.isEmpty()) return layer
+        val dur = (layer.endMs - layer.startMs).coerceAtLeast(1L)
+        val localMs = (playheadMs - layer.startMs).coerceIn(0L, dur)
+        val kf = VideoMediaEngine.interpolateKeyframes(layer.keyframes, localMs)
+        return layer.copy(
+            xNorm = kf.xNorm.coerceIn(0.04f, 0.96f),
+            yNorm = kf.yNorm.coerceIn(0.04f, 0.96f),
+            scale = kf.scale.coerceIn(0.25f, 3.2f),
+            rotationDeg = kf.rotationDeg,
+            opacity = kf.opacity.coerceIn(0f, 1f)
+        )
+    }
+
+    /**
      * Exact visual bounding box in viewport coordinates [0..targetW] x [0..targetH].
      * Used BOTH for hit-testing taps on the preview canvas AND sizing the tightly-fitted white transform box.
      */
@@ -148,45 +169,47 @@ object VideoOverlayRenderer {
         context: Context,
         layer: VideoTextOverlay,
         targetW: Float,
-        targetH: Float
+        targetH: Float,
+        playheadMs: Long? = null
     ): OverlayVisualBounds {
+        val eff = resolveOverlayTransformAt(layer, playheadMs)
         val minEdge = min(targetW, targetH).coerceAtLeast(1f)
-        val cx = (layer.xNorm.coerceIn(0.04f, 0.96f)) * targetW
-        val cy = (layer.yNorm.coerceIn(0.04f, 0.96f)) * targetH
+        val cx = (eff.xNorm.coerceIn(0.04f, 0.96f)) * targetW
+        val cy = (eff.yNorm.coerceIn(0.04f, 0.96f)) * targetH
 
-        if (layer.isSticker) {
-            val cropWFrac = (layer.cropRight - layer.cropLeft).coerceIn(0.15f, 1f)
-            val cropHFrac = (layer.cropBottom - layer.cropTop).coerceIn(0.15f, 1f)
-            val naturalAspect = resolveStickerNaturalAspect(context, layer)
+        if (eff.isSticker) {
+            val cropWFrac = (eff.cropRight - eff.cropLeft).coerceIn(0.15f, 1f)
+            val cropHFrac = (eff.cropBottom - eff.cropTop).coerceIn(0.15f, 1f)
+            val naturalAspect = resolveStickerNaturalAspect(context, eff)
             val baseHeight = when {
-                !layer.stickerImageUri.isNullOrBlank() -> minEdge * 0.28f
-                layer.stickerBadgeId?.startsWith("frame_") == true -> minEdge * 0.34f
-                layer.stickerBadgeId?.startsWith("badge_") == true ||
-                    layer.stickerBadgeId?.startsWith("social_") == true -> minEdge * 0.145f
-                layer.stickerBadgeId?.startsWith("arrow_") == true -> minEdge * 0.19f
+                !eff.stickerImageUri.isNullOrBlank() -> minEdge * 0.28f
+                eff.stickerBadgeId?.startsWith("frame_") == true -> minEdge * 0.34f
+                eff.stickerBadgeId?.startsWith("badge_") == true ||
+                    eff.stickerBadgeId?.startsWith("social_") == true -> minEdge * 0.145f
+                eff.stickerBadgeId?.startsWith("arrow_") == true -> minEdge * 0.19f
                 else -> minEdge * 0.18f
             }
-            val fullH = (baseHeight * layer.scale.coerceIn(0.25f, 3.2f)).coerceIn(28f, targetH * 0.92f)
+            val fullH = (baseHeight * eff.scale.coerceIn(0.25f, 3.2f)).coerceIn(28f, targetH * 0.92f)
             val fullW = (fullH * naturalAspect).coerceIn(28f, targetW * 0.92f)
             val croppedW = (fullW * cropWFrac).coerceIn(28f, targetW * 0.94f)
             val croppedH = (fullH * cropHFrac).coerceIn(28f, targetH * 0.94f)
-            return OverlayVisualBounds(cx, cy, croppedW, croppedH, layer.rotationDeg)
+            return OverlayVisualBounds(cx, cy, croppedW, croppedH, eff.rotationDeg)
         } else {
-            val tf = StudioFonts.byId(layer.fontId).loadTypeface(context)
-            val textSizePx = (minEdge * 0.075f * layer.scale.coerceIn(0.3f, 3.0f)).coerceIn(14f, targetW * 0.36f)
+            val tf = StudioFonts.byId(eff.fontId).loadTypeface(context)
+            val textSizePx = (minEdge * 0.075f * eff.scale.coerceIn(0.3f, 3.0f)).coerceIn(14f, targetW * 0.36f)
             val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                 typeface = tf
                 textSize = textSizePx
             }
-            val sample = layer.text.ifBlank { "TEXT" }
+            val sample = eff.text.ifBlank { "TEXT" }
             val textW = max(paint.measureText(sample), sample.length * textSizePx * 0.48f)
             val fm = paint.fontMetrics
             val textH = (fm.descent - fm.ascent).coerceAtLeast(textSizePx)
-            val padX = if (layer.bgEnabled || layer.isCaption) textSizePx * 0.85f else textSizePx * 0.42f
-            val padY = if (layer.bgEnabled || layer.isCaption) textSizePx * 0.48f else textSizePx * 0.32f
+            val padX = if (eff.bgEnabled || eff.isCaption) textSizePx * 0.85f else textSizePx * 0.42f
+            val padY = if (eff.bgEnabled || eff.isCaption) textSizePx * 0.48f else textSizePx * 0.32f
             val boxW = (textW + padX).coerceIn(48f, targetW * 0.96f)
             val boxH = (textH + padY).coerceIn(32f, targetH * 0.85f)
-            return OverlayVisualBounds(cx, cy, boxW, boxH, layer.rotationDeg)
+            return OverlayVisualBounds(cx, cy, boxW, boxH, eff.rotationDeg)
         }
     }
 
@@ -200,10 +223,11 @@ object VideoOverlayRenderer {
     ) {
         for (layer in activeTexts) {
             if (playheadMs !in layer.startMs..layer.endMs) continue
-            if (layer.isSticker) {
-                drawStickerOverlay(context, canvas, layer, playheadMs, targetW.toFloat(), targetH.toFloat())
+            val effective = resolveOverlayTransformAt(layer, playheadMs)
+            if (effective.isSticker) {
+                drawStickerOverlay(context, canvas, effective, playheadMs, targetW.toFloat(), targetH.toFloat())
             } else {
-                drawTextOverlay(context, canvas, layer, playheadMs, targetW.toFloat(), targetH.toFloat())
+                drawTextOverlay(context, canvas, effective, playheadMs, targetW.toFloat(), targetH.toFloat())
             }
         }
     }
@@ -267,7 +291,7 @@ object VideoOverlayRenderer {
             }
         }
 
-        val finalAlpha = (animAlpha * txt.opacity.coerceIn(0.05f, 1f)).coerceIn(0f, 1f)
+        val finalAlpha = (animAlpha * txt.opacity.coerceIn(0f, 1f)).coerceIn(0f, 1f)
         if (finalAlpha <= 0.01f) return
 
         val minEdge = min(targetW, targetH).coerceAtLeast(1f)
@@ -402,10 +426,10 @@ object VideoOverlayRenderer {
             }
         }
 
-        val finalAlpha = (animAlpha * stk.opacity.coerceIn(0.05f, 1f)).coerceIn(0f, 1f)
+        val finalAlpha = (animAlpha * stk.opacity.coerceIn(0f, 1f)).coerceIn(0f, 1f)
         if (finalAlpha <= 0.01f) return
 
-        val bounds = measureOverlayBounds(context, stk, targetW, targetH)
+        val bounds = measureOverlayBounds(context, stk, targetW, targetH, playheadMs = null)
         val drawW = (bounds.width * animScale).coerceAtLeast(16f)
         val drawH = (bounds.height * animScale).coerceAtLeast(16f)
         val cx = bounds.cx

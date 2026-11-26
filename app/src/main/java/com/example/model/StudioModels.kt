@@ -277,6 +277,13 @@ data class HardwareEncoderCapabilities(
     val maxHeight: Int = 1080
 )
 
+enum class KeyframeEasing(val label: String) {
+    LINEAR("Linear"),
+    EASE_IN("Ease In"),
+    EASE_OUT("Ease Out"),
+    EASE_IN_OUT("Ease In-Out")
+}
+
 data class VideoKeyframe(
     val id: String,
     val timeMs: Long,
@@ -284,8 +291,14 @@ data class VideoKeyframe(
     val yNorm: Float = 0f,
     val scale: Float = 1f,
     val rotationDeg: Float = 0f,
-    val opacity: Float = 1f
-)
+    val opacity: Float = 1f,
+    val easing: KeyframeEasing = KeyframeEasing.EASE_IN_OUT
+) {
+    val timestampMs: Long get() = timeMs
+    val offsetX: Float get() = xNorm
+    val offsetY: Float get() = yNorm
+    val rotation: Float get() = rotationDeg
+}
 
 data class VideoAudioClip(
     val id: String,
@@ -394,7 +407,8 @@ data class VideoTextOverlay(
     val cropLeft: Float = 0f,
     val cropTop: Float = 0f,
     val cropRight: Float = 1f,
-    val cropBottom: Float = 1f
+    val cropBottom: Float = 1f,
+    val keyframes: List<VideoKeyframe> = emptyList()
 )
 
 data class VideoEditorState(

@@ -1,6 +1,6 @@
 {
-  "versionCode": 3,
-  "versionName": "1.3",
-  "notes": "Fixed Live FX playback, Resize bounding box, and Chrome OTA Update",
+  "versionCode": 5,
+  "versionName": "2.5",
+  "notes": "Keyframe Animation Engine, Pro Text & Sticker tools, and Share link",
   "apkUrl": "https://github.com/blackdevilking054-star/black-devil-studio-pro/releases/latest/download/app-debug.apk"
 }

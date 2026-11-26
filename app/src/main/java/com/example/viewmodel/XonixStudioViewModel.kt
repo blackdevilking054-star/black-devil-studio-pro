@@ -24,6 +24,7 @@ import com.example.engine.ImageProcessingEngine
 import com.example.engine.MediaExportStore
 import com.example.engine.StickerCatalogItem
 import com.example.engine.VideoMediaEngine
+import com.example.engine.VideoOverlayRenderer
 import com.example.model.AudioEqPreset
 import com.example.model.AudioExportFormat
 import com.example.model.AudioStudioState
@@ -35,6 +36,7 @@ import com.example.model.CopyrightCheckItem
 import com.example.model.EraserStrokePoint
 import com.example.model.HardwareEncoderCapabilities
 import com.example.model.ImageConvertFormat
+import com.example.model.KeyframeEasing
 import com.example.model.LayerKind
 import com.example.model.LightroomGrade
 import com.example.model.LutPreset
@@ -262,9 +264,19 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
                     )
                 ) {
                     is UpdateCheckResult.UpdateAvailable -> {
-                        _availableUpdate.value = result.info
+                        val dismissedCode = AppUpdateChecker.getDismissedVersionCode(appContext)
+                        val shouldShow = AppUpdateChecker.shouldShowUpdateDialog(
+                            remoteVersionCode = result.info.versionCode,
+                            currentVersionCode = BuildConfig.VERSION_CODE,
+                            dismissedVersionCode = dismissedCode,
+                            manualCheck = manual
+                        )
+                        if (shouldShow) {
+                            _availableUpdate.value = result.info
+                        }
                     }
                     is UpdateCheckResult.UpToDate -> {
+                        _availableUpdate.value = null
                         if (manual) {
                             showToast("You're on the latest version (v${result.currentVersionName})")
                         }
@@ -282,6 +294,10 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
     }
 
     fun dismissUpdateDialog() {
+        val dismissed = _availableUpdate.value
+        if (dismissed != null) {
+            AppUpdateChecker.saveDismissedVersionCode(appContext, dismissed.versionCode)
+        }
         _availableUpdate.value = null
     }
 
@@ -536,7 +552,7 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
         videoRenderJob = viewModelScope.launch {
             while (videoRenderDirty.getAndSet(false)) {
                 val isFastImmediate = videoRenderImmediate.getAndSet(false)
-                if (!isFastImmediate) delay(18L)
+                if (!isFastImmediate) delay(8L)
                 val snapshot = _videoState.value
                 val targetEdge = if (snapshot.isPlaying || !isFastImmediate) 600 else 720
                 val rendered = withContext(Dispatchers.Default) {
@@ -1293,23 +1309,200 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
         }
     }
 
-    // --- Diamond Keyframe Animation ---
+    // --- CapCut / VN Diamond Keyframe Animation Engine (Video, Text & Stickers) ---
+
+    companion object {
+        const val KEYFRAME_MATCH_TOLERANCE_MS: Long = 45L
+    }
+
+    private fun normalizeKeyframeAngle(deg: Float): Float {
+        var a = deg % 360f
+        if (a > 180f) a -= 360f
+        if (a < -180f) a += 360f
+        return a
+    }
+
+    private fun upsertKeyframeInList(
+        existing: List<VideoKeyframe>,
+        localMs: Long,
+        xNorm: Float,
+        yNorm: Float,
+        scale: Float,
+        rotationDeg: Float,
+        opacity: Float,
+        easing: KeyframeEasing? = null
+    ): List<VideoKeyframe> {
+        val idx = existing.indexOfFirst { kotlin.math.abs(it.timeMs - localMs) <= KEYFRAME_MATCH_TOLERANCE_MS }
+        return if (idx >= 0) {
+            val prev = existing[idx]
+            val updated = prev.copy(
+                timeMs = localMs,
+                xNorm = xNorm,
+                yNorm = yNorm,
+                scale = scale,
+                rotationDeg = rotationDeg,
+                opacity = opacity,
+                easing = easing ?: prev.easing
+            )
+            existing.mapIndexed { i, k -> if (i == idx) updated else k }.sortedBy { it.timeMs }
+        } else {
+            val added = VideoKeyframe(
+                id = "kf_${UUID.randomUUID().toString().take(6)}",
+                timeMs = localMs,
+                xNorm = xNorm,
+                yNorm = yNorm,
+                scale = scale,
+                rotationDeg = rotationDeg,
+                opacity = opacity,
+                easing = easing ?: KeyframeEasing.EASE_IN_OUT
+            )
+            (existing + added).sortedBy { it.timeMs }
+        }
+    }
+
+    private fun getClipStartMs(s: VideoEditorState, clipId: String): Long {
+        var acc = 0L
+        for (c in s.clips) {
+            if (c.id == clipId) return acc
+            acc += c.effectiveDurationMs
+        }
+        return 0L
+    }
 
     fun getSelectedClipLocalTimeMs(): Long {
         val s = _videoState.value
         val hit = findClipAtPlayhead(s)
-        if (hit != null && hit.second.id == s.selectedClip?.id) {
+        if (hit != null && (s.selectedClipId == null || hit.second.id == s.selectedClipId)) {
             return hit.third
         }
         val target = s.selectedClip ?: return 0L
-        var offset = 0L
-        for (c in s.clips) {
-            if (c.id == target.id) {
-                return (s.playheadMs - offset).coerceIn(0L, target.effectiveDurationMs)
-            }
-            offset += c.effectiveDurationMs
+        val offset = getClipStartMs(s, target.id)
+        return (s.playheadMs - offset).coerceIn(0L, target.effectiveDurationMs)
+    }
+
+    /**
+     * CapCut / VN single-tap Keyframe Toggle (`◆+` / `◆-`) for the active Video, Text, or Sticker layer.
+     * - If a keyframe already exists at the current playhead (±45ms), removes it.
+     * - Otherwise captures the layer's exact current transform (`offsetX`, `offsetY`, `scale`, `rotation`, `opacity`)
+     *   and inserts a sorted Keyframe at the current playhead timestamp.
+     */
+    fun toggleKeyframeAtPlayhead() {
+        val snapshot = _videoState.value
+        val selOverlay = snapshot.selectedTextId?.let { id ->
+            snapshot.textLayers.firstOrNull { it.id == id }
         }
-        return 0L
+        if (selOverlay != null) {
+            val dur = (selOverlay.endMs - selOverlay.startMs).coerceAtLeast(1L)
+            val localMs = (snapshot.playheadMs - selOverlay.startMs).coerceIn(0L, dur)
+            val existingIdx = selOverlay.keyframes.indexOfFirst {
+                kotlin.math.abs(it.timeMs - localMs) <= KEYFRAME_MATCH_TOLERANCE_MS
+            }
+            recordVideoUndoSnapshot()
+            if (existingIdx >= 0) {
+                val removeId = selOverlay.keyframes[existingIdx].id
+                _videoState.update { s ->
+                    s.copy(
+                        textLayers = s.textLayers.map { layer ->
+                            if (layer.id == selOverlay.id) {
+                                layer.copy(keyframes = layer.keyframes.filterNot { it.id == removeId })
+                            } else layer
+                        }
+                    )
+                }
+                showToast("Keyframe removed")
+            } else {
+                val eff = VideoOverlayRenderer.resolveOverlayTransformAt(selOverlay, selOverlay.startMs + localMs)
+                _videoState.update { s ->
+                    s.copy(
+                        playheadMs = (selOverlay.startMs + localMs).coerceIn(0L, maxOf(s.totalDurationMs, selOverlay.endMs)),
+                        textLayers = s.textLayers.map { layer ->
+                            if (layer.id == selOverlay.id) {
+                                layer.copy(
+                                    keyframes = upsertKeyframeInList(
+                                        existing = layer.keyframes,
+                                        localMs = localMs,
+                                        xNorm = eff.xNorm.coerceIn(0.04f, 0.96f),
+                                        yNorm = eff.yNorm.coerceIn(0.04f, 0.96f),
+                                        scale = eff.scale.coerceIn(0.25f, 3.0f),
+                                        rotationDeg = eff.rotationDeg,
+                                        opacity = eff.opacity.coerceIn(0f, 1f)
+                                    )
+                                )
+                            } else layer
+                        }
+                    )
+                }
+                showToast("Keyframe added")
+            }
+            scheduleVideoPreviewRender(true)
+            scheduleAutoSave(WorkspaceType.VIDEO)
+            return
+        }
+
+        // Video clip target
+        val hit = findClipAtPlayhead(snapshot) ?: return
+        val (_, targetClip, exactLocalMs) = hit
+        val existingIdx = targetClip.keyframes.indexOfFirst {
+            kotlin.math.abs(it.timeMs - exactLocalMs) <= KEYFRAME_MATCH_TOLERANCE_MS
+        }
+        recordVideoUndoSnapshot()
+        if (existingIdx >= 0) {
+            val removeId = targetClip.keyframes[existingIdx].id
+            _videoState.update { s ->
+                s.copy(
+                    clips = s.clips.map { clip ->
+                        if (clip.id == targetClip.id) {
+                            clip.copy(keyframes = clip.keyframes.filterNot { it.id == removeId })
+                        } else clip
+                    },
+                    selectedClipId = targetClip.id
+                )
+            }
+            showToast("Keyframe removed")
+        } else {
+            val curX: Float
+            val curY: Float
+            val curScale: Float
+            val curRot: Float
+            val curOpacity: Float
+            if (targetClip.keyframes.isEmpty()) {
+                curX = snapshot.panX.coerceIn(-1f, 1f)
+                curY = snapshot.panY.coerceIn(-1f, 1f)
+                curScale = snapshot.cropZoom.coerceIn(0.25f, 3.0f)
+                curRot = targetClip.rotationDeg
+                curOpacity = 1f
+            } else {
+                val interp = VideoMediaEngine.interpolateKeyframes(targetClip.keyframes, exactLocalMs)
+                curX = interp.xNorm
+                curY = interp.yNorm
+                curScale = interp.scale
+                curRot = interp.rotationDeg
+                curOpacity = interp.opacity
+            }
+            _videoState.update { s ->
+                s.copy(
+                    clips = s.clips.map { clip ->
+                        if (clip.id == targetClip.id) {
+                            clip.copy(
+                                keyframes = upsertKeyframeInList(
+                                    existing = clip.keyframes,
+                                    localMs = exactLocalMs,
+                                    xNorm = curX,
+                                    yNorm = curY,
+                                    scale = curScale,
+                                    rotationDeg = curRot,
+                                    opacity = curOpacity
+                                )
+                            )
+                        } else clip
+                    },
+                    selectedClipId = targetClip.id
+                )
+            }
+            showToast("Keyframe added")
+        }
+        scheduleVideoPreviewRender(true)
+        scheduleAutoSave(WorkspaceType.VIDEO)
     }
 
     fun addOrUpdateKeyframeAtPlayhead(
@@ -1317,47 +1510,91 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
         yNorm: Float? = null,
         scale: Float? = null,
         rotationDeg: Float? = null,
-        opacity: Float? = null
+        opacity: Float? = null,
+        easing: KeyframeEasing? = null
     ) {
         val snapshot = _videoState.value
+        val isSliderUpdate = xNorm != null || yNorm != null || scale != null || rotationDeg != null || opacity != null
+        val selOverlay = snapshot.selectedTextId?.let { id ->
+            snapshot.textLayers.firstOrNull { it.id == id }
+        }
+        if (selOverlay != null) {
+            val dur = (selOverlay.endMs - selOverlay.startMs).coerceAtLeast(1L)
+            val localMs = (snapshot.playheadMs - selOverlay.startMs).coerceIn(0L, dur)
+            recordVideoUndoSnapshot(coalesceTag = if (isSliderUpdate) "kf_overlay_slider" else null)
+            _videoState.update { s ->
+                s.copy(
+                    textLayers = s.textLayers.map { layer ->
+                        if (layer.id != selOverlay.id) return@map layer
+                        val eff = VideoOverlayRenderer.resolveOverlayTransformAt(layer, layer.startMs + localMs)
+                        val nextX = (xNorm ?: eff.xNorm).coerceIn(0.04f, 0.96f)
+                        val nextY = (yNorm ?: eff.yNorm).coerceIn(0.04f, 0.96f)
+                        val nextS = (scale ?: eff.scale).coerceIn(0.25f, 3.0f)
+                        val nextR = rotationDeg ?: eff.rotationDeg
+                        val nextO = (opacity ?: eff.opacity).coerceIn(0f, 1f)
+                        layer.copy(
+                            xNorm = nextX,
+                            yNorm = nextY,
+                            scale = nextS,
+                            rotationDeg = nextR,
+                            opacity = nextO,
+                            keyframes = upsertKeyframeInList(
+                                existing = layer.keyframes,
+                                localMs = localMs,
+                                xNorm = nextX,
+                                yNorm = nextY,
+                                scale = nextS,
+                                rotationDeg = nextR,
+                                opacity = nextO,
+                                easing = easing
+                            )
+                        )
+                    }
+                )
+            }
+            scheduleVideoPreviewRender(true)
+            scheduleAutoSave(WorkspaceType.VIDEO)
+            return
+        }
+
         val hit = findClipAtPlayhead(snapshot) ?: return
         val (_, targetClip, exactLocalMs) = hit
-        val isSliderUpdate = xNorm != null || yNorm != null || scale != null || rotationDeg != null || opacity != null
         recordVideoUndoSnapshot(coalesceTag = if (isSliderUpdate) "kf_slider" else null)
 
         _videoState.update { s ->
             val nextClips = s.clips.map { clip ->
                 if (clip.id != targetClip.id) return@map clip
-                val currentInterp = VideoMediaEngine.interpolateKeyframes(clip.keyframes, exactLocalMs)
-                // Tight 45ms tolerance so user can add multiple distinct keyframes anywhere along the clip
-                val existingIdx = clip.keyframes.indexOfFirst { kotlin.math.abs(it.timeMs - exactLocalMs) <= 45L }
-                val updatedKf = if (existingIdx >= 0) {
-                    val ex = clip.keyframes[existingIdx]
-                    ex.copy(
-                        timeMs = exactLocalMs,
-                        xNorm = xNorm ?: ex.xNorm,
-                        yNorm = yNorm ?: ex.yNorm,
-                        scale = scale ?: ex.scale,
-                        rotationDeg = rotationDeg ?: ex.rotationDeg,
-                        opacity = opacity ?: ex.opacity
-                    )
+                val baseX: Float
+                val baseY: Float
+                val baseScale: Float
+                val baseRot: Float
+                val baseOpacity: Float
+                if (clip.keyframes.isEmpty()) {
+                    baseX = s.panX.coerceIn(-1f, 1f)
+                    baseY = s.panY.coerceIn(-1f, 1f)
+                    baseScale = s.cropZoom.coerceIn(0.25f, 3.0f)
+                    baseRot = clip.rotationDeg
+                    baseOpacity = 1f
                 } else {
-                    VideoKeyframe(
-                        id = "kf_${UUID.randomUUID().toString().take(6)}",
-                        timeMs = exactLocalMs,
-                        xNorm = xNorm ?: currentInterp.xNorm,
-                        yNorm = yNorm ?: currentInterp.yNorm,
-                        scale = scale ?: currentInterp.scale,
-                        rotationDeg = rotationDeg ?: currentInterp.rotationDeg,
-                        opacity = opacity ?: currentInterp.opacity
+                    val interp = VideoMediaEngine.interpolateKeyframes(clip.keyframes, exactLocalMs)
+                    baseX = interp.xNorm
+                    baseY = interp.yNorm
+                    baseScale = interp.scale
+                    baseRot = interp.rotationDeg
+                    baseOpacity = interp.opacity
+                }
+                clip.copy(
+                    keyframes = upsertKeyframeInList(
+                        existing = clip.keyframes,
+                        localMs = exactLocalMs,
+                        xNorm = (xNorm ?: baseX).coerceIn(-1f, 1f),
+                        yNorm = (yNorm ?: baseY).coerceIn(-1f, 1f),
+                        scale = (scale ?: baseScale).coerceIn(0.25f, 3.0f),
+                        rotationDeg = rotationDeg ?: baseRot,
+                        opacity = (opacity ?: baseOpacity).coerceIn(0f, 1f),
+                        easing = easing
                     )
-                }
-                val nextList = if (existingIdx >= 0) {
-                    clip.keyframes.mapIndexed { i, k -> if (i == existingIdx) updatedKf else k }
-                } else {
-                    (clip.keyframes + updatedKf).sortedBy { it.timeMs }
-                }
-                clip.copy(keyframes = nextList)
+                )
             }
             s.copy(clips = nextClips, selectedClipId = targetClip.id)
         }
@@ -1365,14 +1602,149 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
         scheduleAutoSave(WorkspaceType.VIDEO)
     }
 
+    fun setKeyframeSegmentEasing(easing: KeyframeEasing) {
+        val snapshot = _videoState.value
+        val selOverlay = snapshot.selectedTextId?.let { id ->
+            snapshot.textLayers.firstOrNull { it.id == id }
+        }
+        if (selOverlay != null) {
+            val dur = (selOverlay.endMs - selOverlay.startMs).coerceAtLeast(1L)
+            val localMs = (snapshot.playheadMs - selOverlay.startMs).coerceIn(0L, dur)
+            val seg = VideoMediaEngine.findActiveKeyframeSegment(selOverlay.keyframes, localMs) ?: return
+            recordVideoUndoSnapshot()
+            _videoState.update { s ->
+                s.copy(
+                    textLayers = s.textLayers.map { layer ->
+                        if (layer.id != selOverlay.id) layer else {
+                            layer.copy(
+                                keyframes = layer.keyframes.map { kf ->
+                                    if (kf.id == seg.first.id) kf.copy(easing = easing) else kf
+                                }
+                            )
+                        }
+                    }
+                )
+            }
+            scheduleVideoPreviewRender(true)
+            scheduleAutoSave(WorkspaceType.VIDEO)
+            showToast("Curve: ${easing.label}")
+            return
+        }
+
+        val hit = findClipAtPlayhead(snapshot) ?: return
+        val (_, targetClip, localMs) = hit
+        val seg = VideoMediaEngine.findActiveKeyframeSegment(targetClip.keyframes, localMs) ?: return
+        recordVideoUndoSnapshot()
+        _videoState.update { s ->
+            s.copy(
+                clips = s.clips.map { clip ->
+                    if (clip.id != targetClip.id) clip else {
+                        clip.copy(
+                            keyframes = clip.keyframes.map { kf ->
+                                if (kf.id == seg.first.id) kf.copy(easing = easing) else kf
+                            }
+                        )
+                    }
+                }
+            )
+        }
+        scheduleVideoPreviewRender(true)
+        scheduleAutoSave(WorkspaceType.VIDEO)
+        showToast("Curve: ${easing.label}")
+    }
+
+    fun jumpToPreviousKeyframe() {
+        val s = _videoState.value
+        val selOverlay = s.selectedTextId?.let { id -> s.textLayers.firstOrNull { it.id == id } }
+        if (selOverlay != null) {
+            val localMs = s.playheadMs - selOverlay.startMs
+            val prev = selOverlay.keyframes
+                .sortedBy { it.timeMs }
+                .lastOrNull { it.timeMs < localMs - KEYFRAME_MATCH_TOLERANCE_MS } ?: return
+            seekPlayhead((selOverlay.startMs + prev.timeMs).coerceIn(0L, maxOf(s.totalDurationMs, selOverlay.endMs)))
+            return
+        }
+        val hit = findClipAtPlayhead(s)
+        val clip = hit?.second ?: s.selectedClip ?: return
+        val clipStart = getClipStartMs(s, clip.id)
+        val localMs = s.playheadMs - clipStart
+        val prev = clip.keyframes
+            .sortedBy { it.timeMs }
+            .lastOrNull { it.timeMs < localMs - KEYFRAME_MATCH_TOLERANCE_MS } ?: return
+        seekPlayhead((clipStart + prev.timeMs).coerceIn(0L, s.totalDurationMs))
+    }
+
+    fun jumpToNextKeyframe() {
+        val s = _videoState.value
+        val selOverlay = s.selectedTextId?.let { id -> s.textLayers.firstOrNull { it.id == id } }
+        if (selOverlay != null) {
+            val localMs = s.playheadMs - selOverlay.startMs
+            val next = selOverlay.keyframes
+                .sortedBy { it.timeMs }
+                .firstOrNull { it.timeMs > localMs + KEYFRAME_MATCH_TOLERANCE_MS } ?: return
+            seekPlayhead((selOverlay.startMs + next.timeMs).coerceIn(0L, maxOf(s.totalDurationMs, selOverlay.endMs)))
+            return
+        }
+        val hit = findClipAtPlayhead(s)
+        val clip = hit?.second ?: s.selectedClip ?: return
+        val clipStart = getClipStartMs(s, clip.id)
+        val localMs = s.playheadMs - clipStart
+        val next = clip.keyframes
+            .sortedBy { it.timeMs }
+            .firstOrNull { it.timeMs > localMs + KEYFRAME_MATCH_TOLERANCE_MS } ?: return
+        seekPlayhead((clipStart + next.timeMs).coerceIn(0L, s.totalDurationMs))
+    }
+
     fun deleteKeyframe(id: String) {
+        val snapshot = _videoState.value
+        val selOverlay = snapshot.selectedTextId?.let { oid ->
+            snapshot.textLayers.firstOrNull { it.id == oid }
+        }
+        if (selOverlay != null && selOverlay.keyframes.any { it.id == id }) {
+            recordVideoUndoSnapshot()
+            _videoState.update { s ->
+                s.copy(
+                    textLayers = s.textLayers.map { layer ->
+                        if (layer.id == selOverlay.id) {
+                            layer.copy(keyframes = layer.keyframes.filterNot { it.id == id })
+                        } else layer
+                    }
+                )
+            }
+            scheduleVideoPreviewRender(true)
+            scheduleAutoSave(WorkspaceType.VIDEO)
+            showToast("Keyframe removed")
+            return
+        }
         updateSelectedClip { c -> c.copy(keyframes = c.keyframes.filterNot { it.id == id }) }
         showToast("Keyframe removed")
     }
 
-    fun clearKeyframesOnSelectedClip() {
+    fun clearKeyframesOnSelectedTarget() {
+        val snapshot = _videoState.value
+        val selOverlay = snapshot.selectedTextId?.let { oid ->
+            snapshot.textLayers.firstOrNull { it.id == oid }
+        }
+        if (selOverlay != null) {
+            recordVideoUndoSnapshot()
+            _videoState.update { s ->
+                s.copy(
+                    textLayers = s.textLayers.map { layer ->
+                        if (layer.id == selOverlay.id) layer.copy(keyframes = emptyList()) else layer
+                    }
+                )
+            }
+            scheduleVideoPreviewRender(true)
+            scheduleAutoSave(WorkspaceType.VIDEO)
+            showToast("Keyframes cleared")
+            return
+        }
         updateSelectedClip { it.copy(keyframes = emptyList()) }
         showToast("Keyframes cleared")
+    }
+
+    fun clearKeyframesOnSelectedClip() {
+        clearKeyframesOnSelectedTarget()
     }
 
     fun addVideoSticker(symbol: String) {
@@ -1544,11 +1916,11 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
             _videoState.update { it.copy(isPlaying = true) }
             playbackJob?.cancel()
             playbackJob = viewModelScope.launch {
-                val targetStepMs = 33L
+                val targetStepMs = 16L
                 var lastTickMs = SystemClock.elapsedRealtime()
                 while (isActive && _videoState.value.isPlaying) {
                     val nowMs = SystemClock.elapsedRealtime()
-                    val deltaMs = (nowMs - lastTickMs).coerceIn(16L, 95L)
+                    val deltaMs = (nowMs - lastTickMs).coerceIn(8L, 64L)
                     lastTickMs = nowMs
                     val s = _videoState.value
                     val next = s.playheadMs + deltaMs
@@ -1574,7 +1946,7 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
                     _videoSourceAspect.value = VideoMediaEngine.lastRenderedSourceAspect
                     _videoPreviewBitmap.value = rendered
                     val renderElapsed = SystemClock.elapsedRealtime() - renderStart
-                    val sleepMs = (targetStepMs - renderElapsed).coerceAtLeast(8L)
+                    val sleepMs = (targetStepMs - renderElapsed).coerceAtLeast(4L)
                     delay(sleepMs)
                 }
             }
@@ -1615,12 +1987,103 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
     fun updateVideoFraming(zoom: Float? = null, panX: Float? = null, panY: Float? = null, blurredBg: Boolean? = null) {
         recordVideoUndoSnapshot(coalesceTag = "framing")
         _videoState.update { s ->
-            s.copy(
-                cropZoom = zoom ?: s.cropZoom,
-                panX = panX ?: s.panX,
-                panY = panY ?: s.panY,
-                blurredBgFill = blurredBg ?: s.blurredBgFill
-            )
+            val hit = findClipAtPlayhead(s)
+            val activeClip = hit?.second
+            val transformChanged = zoom != null || panX != null || panY != null
+            if (activeClip != null && activeClip.keyframes.isNotEmpty() && transformChanged) {
+                val localMs = hit.third
+                val interp = VideoMediaEngine.interpolateKeyframes(activeClip.keyframes, localMs)
+                val nextZoom = (zoom ?: interp.scale).coerceIn(0.25f, 3.0f)
+                val nextX = (panX ?: interp.xNorm).coerceIn(-1f, 1f)
+                val nextY = (panY ?: interp.yNorm).coerceIn(-1f, 1f)
+                val nextClips = s.clips.map { c ->
+                    if (c.id != activeClip.id) c else {
+                        c.copy(
+                            keyframes = upsertKeyframeInList(
+                                existing = c.keyframes,
+                                localMs = localMs,
+                                xNorm = nextX,
+                                yNorm = nextY,
+                                scale = nextZoom,
+                                rotationDeg = interp.rotationDeg,
+                                opacity = interp.opacity
+                            )
+                        )
+                    }
+                }
+                s.copy(
+                    blurredBgFill = blurredBg ?: s.blurredBgFill,
+                    clips = nextClips
+                )
+            } else {
+                s.copy(
+                    cropZoom = zoom ?: s.cropZoom,
+                    panX = panX ?: s.panX,
+                    panY = panY ?: s.panY,
+                    blurredBgFill = blurredBg ?: s.blurredBgFill
+                )
+            }
+        }
+        scheduleVideoPreviewRender()
+        scheduleAutoSave(WorkspaceType.VIDEO)
+    }
+
+    /**
+     * Delta-based canvas transform for Video Frame (pinch/drag/corner-scale/rotate).
+     * Automatically creates or updates a Keyframe (`◆`) at the current playhead whenever
+     * the active Video clip already has at least one Keyframe!
+     */
+    fun adjustVideoCanvasTransform(
+        zoomFactor: Float = 1f,
+        zoomDelta: Float = 0f,
+        panDeltaX: Float = 0f,
+        panDeltaY: Float = 0f,
+        rotationDeltaDeg: Float = 0f
+    ) {
+        recordVideoUndoSnapshot(coalesceTag = "canvas_transform")
+        _videoState.update { s ->
+            val hit = findClipAtPlayhead(s)
+            val activeClip = hit?.second ?: s.selectedClip
+            if (activeClip != null && activeClip.keyframes.isNotEmpty()) {
+                val localMs = hit?.third ?: getSelectedClipLocalTimeMs()
+                val cur = VideoMediaEngine.interpolateKeyframes(activeClip.keyframes, localMs)
+                val nextZoom = (cur.scale * zoomFactor + zoomDelta).coerceIn(0.25f, 3.0f)
+                val nextX = (cur.xNorm + panDeltaX).coerceIn(-1f, 1f)
+                val nextY = (cur.yNorm + panDeltaY).coerceIn(-1f, 1f)
+                val nextRot = normalizeKeyframeAngle(cur.rotationDeg + rotationDeltaDeg)
+                val nextClips = s.clips.map { c ->
+                    if (c.id != activeClip.id) c else {
+                        c.copy(
+                            keyframes = upsertKeyframeInList(
+                                existing = c.keyframes,
+                                localMs = localMs,
+                                xNorm = nextX,
+                                yNorm = nextY,
+                                scale = nextZoom,
+                                rotationDeg = nextRot,
+                                opacity = cur.opacity
+                            )
+                        )
+                    }
+                }
+                s.copy(clips = nextClips)
+            } else {
+                val selId = activeClip?.id
+                val nextClips = if (rotationDeltaDeg != 0f && selId != null) {
+                    s.clips.map { c ->
+                        if (c.id == selId) c.copy(rotationDeg = normalizeKeyframeAngle(c.rotationDeg + rotationDeltaDeg))
+                        else c
+                    }
+                } else {
+                    s.clips
+                }
+                s.copy(
+                    cropZoom = (s.cropZoom * zoomFactor + zoomDelta).coerceIn(0.25f, 3.0f),
+                    panX = (s.panX + panDeltaX).coerceIn(-1f, 1f),
+                    panY = (s.panY + panDeltaY).coerceIn(-1f, 1f),
+                    clips = nextClips
+                )
+            }
         }
         scheduleVideoPreviewRender()
         scheduleAutoSave(WorkspaceType.VIDEO)
@@ -1634,18 +2097,45 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
     ) {
         recordVideoUndoSnapshot(coalesceTag = "canvas_transform")
         _videoState.update { s ->
-            val selId = findClipAtPlayhead(s)?.second?.id ?: s.selectedClip?.id
-            val nextClips = if (rotationDeg != null && selId != null) {
-                s.clips.map { c -> if (c.id == selId) c.copy(rotationDeg = rotationDeg) else c }
+            val hit = findClipAtPlayhead(s)
+            val activeClip = hit?.second ?: s.selectedClip
+            if (activeClip != null && activeClip.keyframes.isNotEmpty()) {
+                val localMs = hit?.third ?: getSelectedClipLocalTimeMs()
+                val cur = VideoMediaEngine.interpolateKeyframes(activeClip.keyframes, localMs)
+                val nextZoom = (zoom ?: cur.scale).coerceIn(0.25f, 3.0f)
+                val nextX = (panX ?: cur.xNorm).coerceIn(-1f, 1f)
+                val nextY = (panY ?: cur.yNorm).coerceIn(-1f, 1f)
+                val nextRot = rotationDeg ?: cur.rotationDeg
+                val nextClips = s.clips.map { c ->
+                    if (c.id != activeClip.id) c else {
+                        c.copy(
+                            keyframes = upsertKeyframeInList(
+                                existing = c.keyframes,
+                                localMs = localMs,
+                                xNorm = nextX,
+                                yNorm = nextY,
+                                scale = nextZoom,
+                                rotationDeg = nextRot,
+                                opacity = cur.opacity
+                            )
+                        )
+                    }
+                }
+                s.copy(clips = nextClips)
             } else {
-                s.clips
+                val selId = activeClip?.id
+                val nextClips = if (rotationDeg != null && selId != null) {
+                    s.clips.map { c -> if (c.id == selId) c.copy(rotationDeg = rotationDeg) else c }
+                } else {
+                    s.clips
+                }
+                s.copy(
+                    cropZoom = (zoom ?: s.cropZoom).coerceIn(0.25f, 3.0f),
+                    panX = (panX ?: s.panX).coerceIn(-1f, 1f),
+                    panY = (panY ?: s.panY).coerceIn(-1f, 1f),
+                    clips = nextClips
+                )
             }
-            s.copy(
-                cropZoom = (zoom ?: s.cropZoom).coerceIn(0.25f, 3.0f),
-                panX = (panX ?: s.panX).coerceIn(-1f, 1f),
-                panY = (panY ?: s.panY).coerceIn(-1f, 1f),
-                clips = nextClips
-            )
         }
         scheduleVideoPreviewRender()
         scheduleAutoSave(WorkspaceType.VIDEO)
@@ -1748,7 +2238,47 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
             val id = s.selectedTextId ?: s.textLayers.firstOrNull()?.id ?: return@update s
             s.copy(
                 selectedTextId = id,
-                textLayers = s.textLayers.map { if (it.id == id) transform(it) else it }
+                textLayers = s.textLayers.map { layer ->
+                    if (layer.id != id) return@map layer
+                    if (layer.keyframes.isEmpty()) {
+                        transform(layer)
+                    } else {
+                        // Resolve active interpolated transform so canvas drag/scale/rotate/opacity
+                        // smoothly starts from the playhead pose and auto-upserts a Keyframe!
+                        val effective = VideoOverlayRenderer.resolveOverlayTransformAt(layer, s.playheadMs)
+                        val updated = transform(effective)
+                        val transformChanged =
+                            kotlin.math.abs(updated.xNorm - effective.xNorm) > 0.0001f ||
+                                kotlin.math.abs(updated.yNorm - effective.yNorm) > 0.0001f ||
+                                kotlin.math.abs(updated.scale - effective.scale) > 0.0001f ||
+                                kotlin.math.abs(updated.rotationDeg - effective.rotationDeg) > 0.01f ||
+                                kotlin.math.abs(updated.opacity - effective.opacity) > 0.0001f
+                        if (transformChanged) {
+                            val dur = (updated.endMs - updated.startMs).coerceAtLeast(1L)
+                            val localMs = (s.playheadMs - updated.startMs).coerceIn(0L, dur)
+                            updated.copy(
+                                keyframes = upsertKeyframeInList(
+                                    existing = updated.keyframes,
+                                    localMs = localMs,
+                                    xNorm = updated.xNorm.coerceIn(0.04f, 0.96f),
+                                    yNorm = updated.yNorm.coerceIn(0.04f, 0.96f),
+                                    scale = updated.scale.coerceIn(0.25f, 3.0f),
+                                    rotationDeg = updated.rotationDeg,
+                                    opacity = updated.opacity.coerceIn(0f, 1f)
+                                )
+                            )
+                        } else {
+                            // Style/text-only change: keep base transform + existing keyframes intact
+                            updated.copy(
+                                xNorm = layer.xNorm,
+                                yNorm = layer.yNorm,
+                                scale = layer.scale,
+                                rotationDeg = layer.rotationDeg,
+                                opacity = layer.opacity
+                            )
+                        }
+                    }
+                }
             )
         }
         scheduleVideoPreviewRender()
@@ -1818,7 +2348,17 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
                         val nextEnd = if (newEndMs != null) {
                             newEndMs.coerceIn((nextStart + 300L).coerceAtMost(maxEnd), maxEnd)
                         } else layer.endMs
-                        layer.copy(startMs = nextStart, endMs = nextEnd.coerceAtLeast(nextStart + 300L))
+                        val safeEnd = nextEnd.coerceAtLeast(nextStart + 300L)
+                        val nextDur = (safeEnd - nextStart).coerceAtLeast(300L)
+                        val startDelta = nextStart - layer.startMs
+                        val shiftedKfs = if (layer.keyframes.isEmpty()) {
+                            emptyList()
+                        } else {
+                            layer.keyframes.map { kf ->
+                                kf.copy(timeMs = (kf.timeMs - startDelta).coerceIn(0L, nextDur))
+                            }.sortedBy { it.timeMs }
+                        }
+                        layer.copy(startMs = nextStart, endMs = safeEnd, keyframes = shiftedKfs)
                     }
                 }
             )

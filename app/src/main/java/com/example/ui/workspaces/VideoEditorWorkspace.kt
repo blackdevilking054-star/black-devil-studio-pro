@@ -535,7 +535,13 @@ fun VideoEditorWorkspace(
         val kfs = activePlayheadClip?.keyframes.orEmpty()
         VideoMediaEngine.interpolateKeyframes(kfs, activePlayheadLocalMs)
     }
-    val selectedClipRotDeg = (activePlayheadClip?.rotationDeg ?: state.selectedClip?.rotationDeg ?: 0f) + activeKeyframeInterp.rotationDeg
+    val hasActiveVideoKeyframes = activePlayheadClip?.keyframes?.isNotEmpty() == true
+    val selectedClipRotDeg = if (hasActiveVideoKeyframes) {
+        activeKeyframeInterp.rotationDeg
+    } else {
+        activePlayheadClip?.rotationDeg ?: state.selectedClip?.rotationDeg ?: 0f
+    }
+    val activeKeyframeTarget = remember(state) { resolveActiveKeyframeTarget(state) }
 
     val selectedOverlayLayer = remember(state.textLayers, state.selectedTextId) {
         state.textLayers.firstOrNull { it.id == state.selectedTextId }
@@ -648,7 +654,13 @@ fun VideoEditorWorkspace(
                                         .filter { curState.playheadMs in it.startMs..it.endMs }
                                         .asReversed()
                                     for (layer in visibleOverlays) {
-                                        val b = VideoOverlayRenderer.measureOverlayBounds(context, layer, w, h)
+                                        val b = VideoOverlayRenderer.measureOverlayBounds(
+                                            context = context,
+                                            layer = layer,
+                                            targetW = w,
+                                            targetH = h,
+                                            playheadMs = curState.playheadMs
+                                        )
                                         val pad = 16f
                                         val hit = tapOffset.x in (b.cx - b.width / 2f - pad)..(b.cx + b.width / 2f + pad) &&
                                             tapOffset.y in (b.cy - b.height / 2f - pad)..(b.cy + b.height / 2f + pad)
@@ -733,13 +745,12 @@ fun VideoEditorWorkspace(
                                             }
                                         }
                                         CanvasSelectionTarget.VIDEO -> if (currentState.clips.isNotEmpty()) {
-                                            // Pure pinch-scale & pan on Video Frame — NO accidental rotation
-                                            val s = currentState
-                                            viewModel.updateVideoCanvasTransform(
-                                                zoom = if (zoom != 1f) (s.cropZoom * zoom).coerceIn(0.25f, 3.0f) else null,
-                                                panX = if (pan.x != 0f) (s.panX + pan.x / (w * 0.4f)).coerceIn(-1f, 1f) else null,
-                                                panY = if (pan.y != 0f) (s.panY + pan.y / (h * 0.4f)).coerceIn(-1f, 1f) else null,
-                                                rotationDeg = null
+                                            // Pure pinch-scale & pan on Video Frame — auto-keyframes when keyframes exist
+                                            viewModel.adjustVideoCanvasTransform(
+                                                zoomFactor = zoom,
+                                                panDeltaX = pan.x / (w * 0.4f),
+                                                panDeltaY = pan.y / (h * 0.4f),
+                                                rotationDeltaDeg = 0f
                                             )
                                         }
                                         CanvasSelectionTarget.NONE -> Unit
@@ -777,18 +788,23 @@ fun VideoEditorWorkspace(
                             fitH = fitW / safeSrcAspect
                         }
                         val stabilizeBoost = if (activePlayheadClip.stabilizeEnabled) 1.09f else 1f
-                        val effZoom = state.cropZoom.coerceIn(0.25f, 3.0f) *
-                            activeKeyframeInterp.scale.coerceIn(0.2f, 3.0f) *
-                            stabilizeBoost
+                        val baseScale = if (hasActiveVideoKeyframes) {
+                            activeKeyframeInterp.scale.coerceIn(0.25f, 3.0f)
+                        } else {
+                            state.cropZoom.coerceIn(0.25f, 3.0f)
+                        }
+                        val basePanX = if (hasActiveVideoKeyframes) activeKeyframeInterp.xNorm else state.panX
+                        val basePanY = if (hasActiveVideoKeyframes) activeKeyframeInterp.yNorm else state.panY
+                        val effZoom = baseScale * stabilizeBoost
                         val drawW = fitW * effZoom
                         val drawH = fitH * effZoom
                         val clampedCx = ImageProcessingEngine.clampFrameCenter(
-                            canvasW / 2f + (state.panX + activeKeyframeInterp.xNorm) * canvasW * 0.4f,
+                            canvasW / 2f + basePanX * canvasW * 0.4f,
                             drawW,
                             canvasW.toFloat()
                         )
                         val clampedCy = ImageProcessingEngine.clampFrameCenter(
-                            canvasH / 2f + (state.panY + activeKeyframeInterp.yNorm) * canvasH * 0.4f,
+                            canvasH / 2f + basePanY * canvasH * 0.4f,
                             drawH,
                             canvasH.toFloat()
                         )
@@ -810,29 +826,21 @@ fun VideoEditorWorkspace(
                             showDeleteX = false,
                             onDeleteClick = {},
                             onDragMoveDelta = { dxPx, dyPx ->
-                                val s = currentState
-                                viewModel.updateVideoCanvasTransform(
-                                    panX = (s.panX + dxPx / (canvasW.toFloat() * 0.4f)).coerceIn(-1f, 1f),
-                                    panY = (s.panY + dyPx / (canvasH.toFloat() * 0.4f)).coerceIn(-1f, 1f)
+                                viewModel.adjustVideoCanvasTransform(
+                                    panDeltaX = dxPx / (canvasW.toFloat() * 0.4f),
+                                    panDeltaY = dyPx / (canvasH.toFloat() * 0.4f)
                                 )
                             },
                             onPinchRotate = { zoom, _ ->
-                                val s = currentState
                                 if (zoom != 1f) {
-                                    viewModel.updateVideoCanvasTransform(
-                                        zoom = (s.cropZoom * zoom).coerceIn(0.25f, 3.0f)
-                                    )
+                                    viewModel.adjustVideoCanvasTransform(zoomFactor = zoom)
                                 }
                             },
                             onCornerScaleDelta = { deltaNorm ->
-                                val nextZoom = (currentState.cropZoom + deltaNorm * 1.1f).coerceIn(0.25f, 3.0f)
-                                viewModel.updateVideoCanvasTransform(zoom = nextZoom)
+                                viewModel.adjustVideoCanvasTransform(zoomDelta = deltaNorm * 1.1f)
                             },
                             onRotateDeltaDeg = { deltaDeg ->
-                                val baseRot = activePlayheadClip.rotationDeg
-                                viewModel.updateVideoCanvasTransform(
-                                    rotationDeg = normalizeAngleDeg(baseRot + deltaDeg)
-                                )
+                                viewModel.adjustVideoCanvasTransform(rotationDeltaDeg = deltaDeg)
                             },
                             onTapBox = {
                                 canvasSelection = CanvasSelectionTarget.NONE
@@ -856,7 +864,8 @@ fun VideoEditorWorkspace(
                             context = context,
                             layer = selectedOverlayLayer,
                             targetW = canvasW.toFloat(),
-                            targetH = canvasH.toFloat()
+                            targetH = canvasH.toFloat(),
+                            playheadMs = state.playheadMs
                         )
                         val boxW = b.width.roundToInt().coerceIn(36, canvasW)
                         val boxH = b.height.roundToInt().coerceIn(36, canvasH)
@@ -868,7 +877,7 @@ fun VideoEditorWorkspace(
                             topPx = topPx,
                             boxW = boxW,
                             boxH = boxH,
-                            rotationDeg = selectedOverlayLayer.rotationDeg,
+                            rotationDeg = b.rotationDeg,
                             showDeleteX = true,
                             onDeleteClick = {
                                 val delId = selectedOverlayLayer.id
@@ -1296,6 +1305,31 @@ fun VideoEditorWorkspace(
                 .weight(if (isToolDrawerExpanded) 0.55f else 0.38f)
         ) {
             Column(modifier = Modifier.fillMaxSize()) {
+                // CapCut / VN Inline Keyframe Control Strip (`<◆` | `◆+ / ◆-` | `◆>` + Easing Curve)
+                AnimatedVisibility(
+                    visible = activeKeyframeTarget != null &&
+                        (state.selectedClipId != null ||
+                            state.selectedTextId != null ||
+                            activeKeyframeTarget.keyframes.isNotEmpty() ||
+                            activeTab == VideoToolTab.KEYFRAME),
+                    enter = expandVertically(),
+                    exit = shrinkVertically()
+                ) {
+                    activeKeyframeTarget?.let { kfTarget ->
+                        CompactCapCutKeyframeBar(
+                            target = kfTarget,
+                            onPreviousKeyframe = { viewModel.jumpToPreviousKeyframe() },
+                            onToggleKeyframe = { viewModel.toggleKeyframeAtPlayhead() },
+                            onNextKeyframe = { viewModel.jumpToNextKeyframe() },
+                            onSelectEasing = { viewModel.setKeyframeSegmentEasing(it) },
+                            onOpenKeyframeDrawer = {
+                                activeTab = VideoToolTab.KEYFRAME
+                                isToolDrawerExpanded = true
+                            }
+                        )
+                    }
+                }
+
                 // Contextual Floating Quick-Action Bar (Hidden until a clip is tapped)
                 AnimatedVisibility(
                     visible = isClipQuickBarVisible && state.selectedClipId != null && state.selectedClip != null,
@@ -1329,13 +1363,12 @@ fun VideoEditorWorkspace(
                                 }
                             )
                             QuickActionChip(
-                                label = "Keyframe ◆",
+                                label = if (activeKeyframeTarget?.activeKeyframe != null && !activeKeyframeTarget.isOverlay) "Keyframe ◆-" else "Keyframe ◆+",
                                 icon = Icons.Default.Diamond,
-                                tint = ProAmber,
+                                tint = ElectricCyan,
                                 testTagName = "quick_action_keyframe",
                                 onClick = {
-                                    viewModel.addOrUpdateKeyframeAtPlayhead()
-                                    viewModel.showToast("Keyframe set")
+                                    viewModel.toggleKeyframeAtPlayhead()
                                 }
                             )
                             QuickActionChip(
@@ -1688,38 +1721,22 @@ fun VideoEditorWorkspace(
                                                 }
                                             }
 
-                                            // Exact-Timestamp Diamond Keyframe Markers aligned dead-center with Playhead
+                                            // Glowing Crimson/White Diamond Keyframe Markers (`◆`) at exact timestamps
                                             if (clip.keyframes.isNotEmpty()) {
-                                                val clipWpx = with(density) { clipWidthDp.toPx() }.coerceAtLeast(1f)
-                                                val markerPx = with(density) { 14.dp.toPx() }
-                                                clip.keyframes.forEach { kf ->
-                                                    val frac = (kf.timeMs.toFloat() / clip.effectiveDurationMs.coerceAtLeast(1L).toFloat())
-                                                        .coerceIn(0f, 1f)
-                                                    val xPx = (clipWpx * frac - markerPx / 2f)
-                                                        .roundToInt()
-                                                        .coerceIn(0, (clipWpx - markerPx).roundToInt().coerceAtLeast(0))
-                                                    val nearPlayhead = abs((clipStartMs + kf.timeMs) - state.playheadMs) <= 95L
-                                                    Box(
-                                                        modifier = Modifier
-                                                            .align(Alignment.TopStart)
-                                                            .offset { IntOffset(xPx, with(density) { 4.dp.roundToPx() }) }
-                                                            .size(14.dp)
-                                                            .zIndex(6f)
-                                                            .clickable {
-                                                                viewModel.selectClip(clip.id)
-                                                                viewModel.seekPlayhead(clipStartMs + kf.timeMs)
-                                                            }
-                                                            .testTag("keyframe_marker_${clip.id}_${kf.id}"),
-                                                        contentAlignment = Alignment.Center
-                                                    ) {
-                                                        Icon(
-                                                            imageVector = Icons.Default.Diamond,
-                                                            contentDescription = "Keyframe",
-                                                            tint = if (nearPlayhead) Color.White else ProAmber,
-                                                            modifier = Modifier.size(13.dp)
-                                                        )
+                                                TimelineKeyframeDiamondMarkers(
+                                                    keyframes = clip.keyframes,
+                                                    clipDurationMs = clip.effectiveDurationMs,
+                                                    clipStartMs = clipStartMs,
+                                                    playheadMs = state.playheadMs,
+                                                    clipWidthDp = clipWidthDp,
+                                                    topPaddingDp = 4.dp,
+                                                    tagOwnerId = clip.id,
+                                                    onSelectKeyframe = { kf ->
+                                                        viewModel.selectClip(clip.id)
+                                                        canvasSelection = CanvasSelectionTarget.VIDEO
+                                                        viewModel.seekPlayhead(clipStartMs + kf.timeMs)
                                                     }
-                                                }
+                                                )
                                             }
 
                                             // Immediate-Claim Left & Right Trim Handles (never stolen by horizontalScroll)
@@ -2324,6 +2341,28 @@ fun VideoEditorWorkspace(
                                                             text = String.format(Locale.US, "%.1fs", txtDurMs / 1000f),
                                                             style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp),
                                                             color = Color.White.copy(alpha = 0.85f)
+                                                        )
+                                                    }
+
+                                                    // Glowing Crimson/White Diamond Keyframe Markers (`◆`) on Text & Sticker Bars
+                                                    if (tLayer.keyframes.isNotEmpty()) {
+                                                        TimelineKeyframeDiamondMarkers(
+                                                            keyframes = tLayer.keyframes,
+                                                            clipDurationMs = txtDurMs,
+                                                            clipStartMs = tLayer.startMs,
+                                                            playheadMs = state.playheadMs,
+                                                            clipWidthDp = txtWidthDp,
+                                                            topPaddingDp = 2.dp,
+                                                            tagOwnerId = tLayer.id,
+                                                            onSelectKeyframe = { kf ->
+                                                                viewModel.selectVideoText(tLayer.id)
+                                                                canvasSelection = if (tLayer.isSticker) {
+                                                                    CanvasSelectionTarget.STICKER
+                                                                } else {
+                                                                    CanvasSelectionTarget.TEXT
+                                                                }
+                                                                viewModel.seekPlayhead(tLayer.startMs + kf.timeMs)
+                                                            }
                                                         )
                                                     }
 
@@ -3316,108 +3355,25 @@ fun VideoEditorWorkspace(
                         }
 
                         VideoToolTab.KEYFRAME -> {
-                            val clip = state.selectedClip
-                            if (clip != null) {
-                                val localMs = viewModel.getSelectedClipLocalTimeMs()
-                                val interp = VideoMediaEngine.interpolateKeyframes(clip.keyframes, localMs)
-
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                                ) {
-                                    StudioActionPill(
-                                        label = "+ Add Keyframe ◆",
-                                        icon = Icons.Default.Diamond,
-                                        accent = ProAmber,
-                                        onClick = {
-                                            viewModel.addOrUpdateKeyframeAtPlayhead()
-                                            viewModel.showToast("Keyframe set at ${formatSimpleTime(localMs)}")
-                                        },
-                                        modifier = Modifier.weight(1f)
+                            ProKeyframeDrawerPanel(
+                                target = activeKeyframeTarget,
+                                onPreviousKeyframe = { viewModel.jumpToPreviousKeyframe() },
+                                onToggleKeyframe = { viewModel.toggleKeyframeAtPlayhead() },
+                                onNextKeyframe = { viewModel.jumpToNextKeyframe() },
+                                onSelectEasing = { viewModel.setKeyframeSegmentEasing(it) },
+                                onJumpToTimestamp = { ts -> viewModel.seekPlayhead(ts) },
+                                onDeleteKeyframe = { id -> viewModel.deleteKeyframe(id) },
+                                onClearAllKeyframes = { viewModel.clearKeyframesOnSelectedTarget() },
+                                onUpdateTransform = { x, y, sc, rot, op ->
+                                    viewModel.addOrUpdateKeyframeAtPlayhead(
+                                        xNorm = x,
+                                        yNorm = y,
+                                        scale = sc,
+                                        rotationDeg = rot,
+                                        opacity = op
                                     )
-                                    if (clip.keyframes.isNotEmpty()) {
-                                        StudioActionPill(
-                                            label = "Clear",
-                                            icon = Icons.Default.Delete,
-                                            accent = SignalRed,
-                                            onClick = { viewModel.clearKeyframesOnSelectedClip() }
-                                        )
-                                    }
                                 }
-
-                                if (clip.keyframes.isNotEmpty()) {
-                                    Row(
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .horizontalScroll(rememberScrollState()),
-                                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                                    ) {
-                                        clip.keyframes.forEachIndexed { idx, kf ->
-                                            Surface(
-                                                onClick = {
-                                                    var clipOffset = 0L
-                                                    for (c in state.clips) {
-                                                        if (c.id == clip.id) break
-                                                        clipOffset += c.effectiveDurationMs
-                                                    }
-                                                    viewModel.seekPlayhead(clipOffset + kf.timeMs)
-                                                },
-                                                shape = RoundedCornerShape(10.dp),
-                                                color = ProAmberContainer,
-                                                border = BorderStroke(1.dp, ProAmber)
-                                            ) {
-                                                Row(
-                                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp),
-                                                    verticalAlignment = Alignment.CenterVertically,
-                                                    horizontalArrangement = Arrangement.spacedBy(4.dp)
-                                                ) {
-                                                    Icon(Icons.Default.Diamond, contentDescription = null, tint = ProAmber, modifier = Modifier.size(12.dp))
-                                                    Text(
-                                                        text = "KF${idx + 1} ${String.format(Locale.US, "%.1fs", kf.timeMs / 1000f)}",
-                                                        style = MaterialTheme.typography.labelSmall,
-                                                        color = TextPrimary
-                                                    )
-                                                    IconButton(
-                                                        onClick = { viewModel.deleteKeyframe(kf.id) },
-                                                        modifier = Modifier.size(18.dp)
-                                                    ) {
-                                                        Icon(Icons.Default.Delete, contentDescription = "Delete Keyframe", tint = SignalRed, modifier = Modifier.size(13.dp))
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-
-                                Row(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .horizontalScroll(rememberScrollState()),
-                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                                ) {
-                                    VideoKeyframeControl.entries.forEach { ctrl ->
-                                        StudioChipButton(text = ctrl.label, selected = keyframeControl == ctrl, onClick = { keyframeControl = ctrl })
-                                    }
-                                }
-
-                                when (keyframeControl) {
-                                    VideoKeyframeControl.SCALE -> StudioSliderRow("Keyframe Scale", interp.scale, 0.4f..2.2f, "${(interp.scale * 100).roundToInt()}%") { v ->
-                                        viewModel.addOrUpdateKeyframeAtPlayhead(scale = v)
-                                    }
-                                    VideoKeyframeControl.POS_X -> StudioSliderRow("Move Left / Right", interp.xNorm, -0.6f..0.6f, "${(interp.xNorm * 100).roundToInt()}%") { v ->
-                                        viewModel.addOrUpdateKeyframeAtPlayhead(xNorm = v)
-                                    }
-                                    VideoKeyframeControl.POS_Y -> StudioSliderRow("Move Up / Down", interp.yNorm, -0.6f..0.6f, "${(interp.yNorm * 100).roundToInt()}%") { v ->
-                                        viewModel.addOrUpdateKeyframeAtPlayhead(yNorm = v)
-                                    }
-                                    VideoKeyframeControl.ROTATE -> StudioSliderRow("Keyframe Rotate", interp.rotationDeg, -180f..180f, "${interp.rotationDeg.roundToInt()}°") { v ->
-                                        viewModel.addOrUpdateKeyframeAtPlayhead(rotationDeg = v)
-                                    }
-                                    VideoKeyframeControl.OPACITY -> StudioSliderRow("Keyframe Opacity", interp.opacity, 0f..1f, "${(interp.opacity * 100).roundToInt()}%") { v ->
-                                        viewModel.addOrUpdateKeyframeAtPlayhead(opacity = v)
-                                    }
-                                }
-                            }
+                            )
                         }
 
                         VideoToolTab.TEXT -> {
@@ -3425,6 +3381,7 @@ fun VideoEditorWorkspace(
                                 textLayers = state.textLayers,
                                 selectedTextId = state.selectedTextId,
                                 isListeningCaptions = state.isListeningCaptions,
+                                playheadMs = state.playheadMs,
                                 onAddText = {
                                     viewModel.addVideoText("NEW TITLE", isCaption = false)
                                     canvasSelection = CanvasSelectionTarget.TEXT
@@ -3471,6 +3428,7 @@ fun VideoEditorWorkspace(
                                 stickerLayers = state.textLayers.filter { it.isSticker },
                                 selectedTextId = state.selectedTextId,
                                 isCropping = isStickerCropping,
+                                playheadMs = state.playheadMs,
                                 onAddCatalogSticker = { item ->
                                     viewModel.addCatalogSticker(item)
                                     canvasSelection = CanvasSelectionTarget.STICKER

@@ -93,4 +93,23 @@ class AppUpdateCheckerTest {
         assertFalse(AppUpdateChecker.isTrustedGitHubHttpsUrl("https://user@github.com/repo/app.apk"))
         assertFalse(AppUpdateChecker.isTrustedGitHubHttpsUrl("https://notgithub.com/repo/app.apk"))
     }
+
+    @Test
+    fun shouldShowUpdateDialog_respectsVersionCodeAndDismissedVersion() {
+        // Installed v2.5 (5) vs remote v2.5 (5): never shows (auto or manual)
+        assertFalse(AppUpdateChecker.shouldShowUpdateDialog(remoteVersionCode = 5, currentVersionCode = 5, dismissedVersionCode = 0, manualCheck = false))
+        assertFalse(AppUpdateChecker.shouldShowUpdateDialog(remoteVersionCode = 5, currentVersionCode = 5, dismissedVersionCode = 0, manualCheck = true))
+
+        // Remote v2.6 (6) when not yet dismissed: shows on auto and manual
+        assertTrue(AppUpdateChecker.shouldShowUpdateDialog(remoteVersionCode = 6, currentVersionCode = 5, dismissedVersionCode = 0, manualCheck = false))
+        assertTrue(AppUpdateChecker.shouldShowUpdateDialog(remoteVersionCode = 6, currentVersionCode = 5, dismissedVersionCode = 0, manualCheck = true))
+
+        // After tapping "Later" on version 6: auto check stays silent, manual check still shows
+        assertFalse(AppUpdateChecker.shouldShowUpdateDialog(remoteVersionCode = 6, currentVersionCode = 5, dismissedVersionCode = 6, manualCheck = false))
+        assertTrue(AppUpdateChecker.shouldShowUpdateDialog(remoteVersionCode = 6, currentVersionCode = 5, dismissedVersionCode = 6, manualCheck = true))
+
+        // When version 7 is published after dismissing 6: auto check shows again
+        assertTrue(AppUpdateChecker.shouldShowUpdateDialog(remoteVersionCode = 7, currentVersionCode = 5, dismissedVersionCode = 6, manualCheck = false))
+    }
 }
+

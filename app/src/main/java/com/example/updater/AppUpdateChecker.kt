@@ -36,6 +36,8 @@ object AppUpdateChecker {
         "https://raw.githubusercontent.com/blackdevilking054-star/black-devil-studio-pro/main/version.json"
 
     private const val CHROME_PACKAGE = "com.android.chrome"
+    private const val PREFS_NAME = "bd_ota_update_prefs"
+    private const val KEY_DISMISSED_VERSION_CODE = "dismissed_version_code"
     private const val CONNECT_TIMEOUT_MS = 7_000
     private const val READ_TIMEOUT_MS = 7_000
     private const val MAX_RESPONSE_BYTES = 32 * 1024 // 32 KB cap for safety
@@ -53,6 +55,37 @@ object AppUpdateChecker {
         ".githubusercontent.com",
         ".github.io"
     )
+
+    fun getDismissedVersionCode(context: Context): Int {
+        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getInt(KEY_DISMISSED_VERSION_CODE, 0)
+    }
+
+    fun saveDismissedVersionCode(context: Context, versionCode: Int) {
+        if (versionCode <= 0) return
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putInt(KEY_DISMISSED_VERSION_CODE, versionCode)
+            .apply()
+    }
+
+    /**
+     * Pure decision helper for whether the "Update Available" dialog should be shown:
+     * - Never shows unless remoteVersionCode > currentVersionCode.
+     * - Manual checks always show whenever a strictly newer version exists.
+     * - Automatic launch checks skip versions the user already dismissed with "Later"
+     *   until an even newer versionCode is published.
+     */
+    fun shouldShowUpdateDialog(
+        remoteVersionCode: Int,
+        currentVersionCode: Int,
+        dismissedVersionCode: Int,
+        manualCheck: Boolean
+    ): Boolean {
+        if (remoteVersionCode <= currentVersionCode) return false
+        if (manualCheck) return true
+        return remoteVersionCode > dismissedVersionCode
+    }
 
     suspend fun checkForUpdate(
         currentVersionCode: Int,

@@ -15,6 +15,7 @@ import android.os.Build
 import android.view.Surface
 import com.example.R
 import com.example.model.HardwareEncoderCapabilities
+import com.example.model.KeyframeEasing
 import com.example.model.SpeedCurvePreset
 import com.example.model.VideoClip
 import com.example.model.VideoEditorState
@@ -200,8 +201,47 @@ object VideoMediaEngine {
     }
 
     /**
-     * Smoothly interpolates Diamond Keyframe transforms across a clip's local playhead
-     * using cubic ease-in-out (smoothstep) with clamped finite values.
+     * Evaluates a normalized segment parameter t in [0, 1] with the selected CapCut/VN easing curve.
+     */
+    fun applyKeyframeEasing(t: Float, easing: KeyframeEasing): Float {
+        val x = t.coerceIn(0f, 1f)
+        return when (easing) {
+            KeyframeEasing.LINEAR -> x
+            KeyframeEasing.EASE_IN -> x * x * x
+            KeyframeEasing.EASE_OUT -> {
+                val inv = 1f - x
+                1f - inv * inv * inv
+            }
+            KeyframeEasing.EASE_IN_OUT -> x * x * (3f - 2f * x)
+        }
+    }
+
+    /**
+     * Returns the surrounding (startKf, endKf) pair when [localMs] lies strictly between two keyframes,
+     * or null if before the first keyframe, after the last keyframe, or fewer than 2 keyframes exist.
+     */
+    fun findActiveKeyframeSegment(
+        keyframes: List<VideoKeyframe>,
+        localMs: Long
+    ): Pair<VideoKeyframe, VideoKeyframe>? {
+        if (keyframes.size < 2) return null
+        val sorted = keyframes.sortedBy { it.timeMs }
+        if (localMs <= sorted.first().timeMs || localMs >= sorted.last().timeMs) return null
+        for (i in 0 until sorted.lastIndex) {
+            val a = sorted[i]
+            val b = sorted[i + 1]
+            if (localMs >= a.timeMs && localMs < b.timeMs) {
+                return a to b
+            }
+        }
+        return null
+    }
+
+    /**
+     * Smoothly interpolates Diamond Keyframe transforms across a clip or overlay's local playhead
+     * using each segment's Easing Curve with clamped finite values.
+     * Holds the first keyframe's values before the first timestamp, and holds the last keyframe's
+     * values after the last timestamp.
      */
     fun interpolateKeyframes(keyframes: List<VideoKeyframe>, localClipMs: Long): InterpolatedKeyframe {
         if (keyframes.isEmpty()) return InterpolatedKeyframe()
@@ -228,8 +268,7 @@ object VideoMediaEngine {
             if (localClipMs in a.timeMs..b.timeMs) {
                 val span = (b.timeMs - a.timeMs).coerceAtLeast(1L).toFloat()
                 val t = ((localClipMs - a.timeMs) / span).coerceIn(0f, 1f)
-                // Smooth cubic Hermite ease-in-out for cinematic motion with zero flicker
-                val ease = t * t * (3f - 2f * t)
+                val ease = applyKeyframeEasing(t, a.easing)
                 return sanitized(
                     x = a.xNorm + (b.xNorm - a.xNorm) * ease,
                     y = a.yNorm + (b.yNorm - a.yNorm) * ease,
@@ -679,29 +718,36 @@ object VideoMediaEngine {
             }
         }
 
+        val hasVideoKeyframes = activeClip.keyframes.isNotEmpty()
+        val effCropZoom = if (hasVideoKeyframes) kf.scale else state.cropZoom
+        val effPanX = if (hasVideoKeyframes) kf.xNorm else state.panX
+        val effPanY = if (hasVideoKeyframes) kf.yNorm else state.panY
+        val effClipRot = if (hasVideoKeyframes) kf.rotationDeg else activeClip.rotationDeg
+        val effOpacity = if (hasVideoKeyframes) kf.opacity else 1f
+
         val rendered = ImageProcessingEngine.renderVideoFrame(
             context = context,
             sourceFrame = srcFrame,
             targetW = targetW,
             targetH = targetH,
-            cropZoom = state.cropZoom,
-            panX = state.panX,
-            panY = state.panY,
+            cropZoom = effCropZoom,
+            panX = effPanX,
+            panY = effPanY,
             blurredBgFill = state.blurredBgFill,
             bgFillMode = state.bgFillMode,
             bgFillColorArgb = state.bgFillColorArgb,
             bgImageUri = state.bgImageUri,
-            clipRotationDeg = activeClip.rotationDeg,
+            clipRotationDeg = effClipRot,
             clipFlipH = activeClip.flipH,
             clipFlipV = activeClip.flipV,
             clipMirrorMode = activeClip.mirrorMode,
             stabilizeEnabled = activeClip.stabilizeEnabled,
             motionBlur = activeClip.motionBlur,
-            keyframeX = kf.xNorm,
-            keyframeY = kf.yNorm,
-            keyframeScale = kf.scale,
-            keyframeRot = kf.rotationDeg,
-            keyframeOpacity = kf.opacity,
+            keyframeX = 0f,
+            keyframeY = 0f,
+            keyframeScale = 1f,
+            keyframeRot = 0f,
+            keyframeOpacity = effOpacity,
             grade = state.colorGrade,
             pipBitmap = pipBmp,
             pipXNorm = state.pip.xNorm,
@@ -883,7 +929,7 @@ object VideoMediaEngine {
         val encH = target.height
         val encFps = target.fps
         val totalDurationMs = state.totalDurationMs.coerceIn(1000L, 15000L)
-        val totalFrames = ((totalDurationMs / 1000.0) * encFps).roundToInt().coerceIn(24, 300)
+        val totalFrames = ((totalDurationMs / 1000.0) * encFps).roundToInt().coerceIn(24, 900)
         val renderMaxEdge = min(max(encW, encH), 1920)
         val upscalePaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG or android.graphics.Paint.FILTER_BITMAP_FLAG)
 
