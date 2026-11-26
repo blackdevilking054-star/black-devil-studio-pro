@@ -93,6 +93,26 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        val aggressive = level >= TRIM_MEMORY_BACKGROUND || level == TRIM_MEMORY_RUNNING_CRITICAL
+        if (aggressive || level >= TRIM_MEMORY_RUNNING_LOW) {
+            com.example.engine.ImageProcessingEngine.trimMemory(aggressive = aggressive)
+            com.example.engine.TimelineThumbnailCache.trimMemory(aggressive = aggressive)
+            if (aggressive) {
+                com.example.engine.VideoMediaEngine.trimMemory()
+            }
+        }
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onLowMemory() {
+        super.onLowMemory()
+        com.example.engine.ImageProcessingEngine.trimMemory(aggressive = true)
+        com.example.engine.TimelineThumbnailCache.trimMemory(aggressive = true)
+        com.example.engine.VideoMediaEngine.trimMemory()
+    }
 }
 
 @Composable
@@ -109,6 +129,8 @@ private fun XonixStudioApp(
     val toastMessage by viewModel.toastMessage.collectAsStateWithLifecycle()
     val autoSaveLabel by viewModel.autoSaveLabel.collectAsStateWithLifecycle()
     val availableUpdate by viewModel.availableUpdate.collectAsStateWithLifecycle()
+    val canUndoVideo by viewModel.canUndoVideo.collectAsStateWithLifecycle()
+    val canRedoVideo by viewModel.canRedoVideo.collectAsStateWithLifecycle()
 
     val snackbarHostState = remember { SnackbarHostState() }
     var showProfileSheet by remember { mutableStateOf(false) }
@@ -232,6 +254,11 @@ private fun XonixStudioApp(
                         autoSaveLabel = autoSaveLabel,
                         exportProgress = exportProgress,
                         userInitial = userInitial,
+                        canUndo = canUndoVideo,
+                        canRedo = canRedoVideo,
+                        onNavigateHome = { viewModel.selectWorkspace(StudioWorkspace.HOME) },
+                        onUndo = { viewModel.undoVideoEdit() },
+                        onRedo = { viewModel.redoVideoEdit() },
                         onQuickSave = { viewModel.saveCurrentWorkspaceSnapshot() },
                         onShareApp = { viewModel.shareAppWithFriends() },
                         onOpenProfile = { showProfileSheet = true },

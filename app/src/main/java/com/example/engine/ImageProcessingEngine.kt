@@ -49,29 +49,73 @@ import kotlin.math.sqrt
 
 object ImageProcessingEngine {
 
-    // Bounded 16MB LRU cache of decoded source bitmaps for smooth 2GB/3GB RAM operation
-    private val sourceBitmapCache = object : LruCache<String, Bitmap>(16 * 1024) {
-        override fun sizeOf(key: String, value: Bitmap): Int = (value.byteCount / 1024).coerceAtLeast(1)
+    const val MAX_PREVIEW_DIMENSION_PX: Int = 1080
+    const val MAX_EXPORT_DIMENSION_PX: Int = 2048
+
+    // Dynamically bounded LRU cache sized to <= 1/12th of JVM max heap (8 MB..20 MB)
+    // so 2GB/3GB RAM Android phones never hit OutOfMemoryError while editing photos or stickers.
+    private val maxCacheKb: Int = run {
+        val heapKb = (Runtime.getRuntime().maxMemory() / 1024L).coerceAtLeast(32L * 1024L)
+        (heapKb / 12L).coerceIn(8L * 1024L, 20L * 1024L).toInt()
+    }
+
+    private val sourceBitmapCache = object : LruCache<String, Bitmap>(maxCacheKb) {
+        override fun sizeOf(key: String, value: Bitmap): Int {
+            return if (value.isRecycled) 1 else (value.allocationByteCount / 1024).coerceAtLeast(1)
+        }
+    }
+
+    fun trimMemory(aggressive: Boolean) {
+        synchronized(sourceBitmapCache) {
+            if (aggressive) {
+                sourceBitmapCache.evictAll()
+            } else {
+                sourceBitmapCache.trimToSize(maxCacheKb / 2)
+            }
+        }
+    }
+
+    /**
+     * Quantizes requested decode dimensions into fixed cache buckets so 60fps pinch/keyframe
+     * scaling hits [sourceBitmapCache] cleanly without repeated disk decodes.
+     */
+    fun quantizeDecodeDimension(requestedMaxDim: Int, isExport: Boolean = false): Int {
+        if (isExport) {
+            return requestedMaxDim.coerceIn(128, MAX_EXPORT_DIMENSION_PX)
+        }
+        val capped = requestedMaxDim.coerceIn(64, MAX_PREVIEW_DIMENSION_PX)
+        return when {
+            capped <= 128 -> 128
+            capped <= 256 -> 256
+            capped <= 512 -> 512
+            capped <= 768 -> 768
+            else -> MAX_PREVIEW_DIMENSION_PX
+        }
     }
 
     fun decodeSampledBitmap(
         context: Context,
         uriString: String?,
         fallbackDrawable: Int?,
-        maxDimension: Int
+        maxDimension: Int,
+        isExport: Boolean = false
     ): Bitmap? {
-        val cacheKey = "${uriString ?: "res_$fallbackDrawable"}_$maxDimension"
-        sourceBitmapCache.get(cacheKey)?.let { cached ->
-            if (!cached.isRecycled) return cached
+        val targetDim = quantizeDecodeDimension(maxDimension, isExport)
+        val cacheKey = "${uriString ?: "res_$fallbackDrawable"}_$targetDim"
+        synchronized(sourceBitmapCache) {
+            sourceBitmapCache.get(cacheKey)?.let { cached ->
+                if (!cached.isRecycled) return cached
+            }
         }
-        val decoded = try {
-            if (!uriString.isNullOrBlank()) {
+
+        fun attemptDecode(limitDim: Int): Bitmap? {
+            return if (!uriString.isNullOrBlank()) {
                 val uri = Uri.parse(uriString)
                 val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
                 context.contentResolver.openInputStream(uri)?.use {
                     BitmapFactory.decodeStream(it, null, opts)
                 }
-                val sampleSize = computeInSampleSize(opts.outWidth, opts.outHeight, maxDimension)
+                val sampleSize = computeInSampleSize(opts.outWidth, opts.outHeight, limitDim)
                 val decodeOpts = BitmapFactory.Options().apply {
                     inSampleSize = sampleSize
                     inPreferredConfig = Bitmap.Config.ARGB_8888
@@ -82,7 +126,7 @@ object ImageProcessingEngine {
             } else if (fallbackDrawable != null) {
                 val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
                 BitmapFactory.decodeResource(context.resources, fallbackDrawable, opts)
-                val sampleSize = computeInSampleSize(opts.outWidth, opts.outHeight, maxDimension)
+                val sampleSize = computeInSampleSize(opts.outWidth, opts.outHeight, limitDim)
                 val decodeOpts = BitmapFactory.Options().apply {
                     inSampleSize = sampleSize
                     inPreferredConfig = Bitmap.Config.ARGB_8888
@@ -91,16 +135,45 @@ object ImageProcessingEngine {
             } else {
                 null
             }
+        }
+
+        var rawDecoded: Bitmap? = try {
+            attemptDecode(targetDim)
+        } catch (_: OutOfMemoryError) {
+            trimMemory(aggressive = true)
+            runCatching { attemptDecode((targetDim / 2).coerceAtLeast(128)) }.getOrNull()
         } catch (_: Exception) {
             null
         }
-        if (decoded != null && !decoded.isRecycled) {
-            sourceBitmapCache.put(cacheKey, decoded)
+
+        // Strict post-downscale cap: power-of-2 inSampleSize alone can still leave a 4000px photo at 2000px;
+        // downscaling to <= targetDim immediately cuts heap usage by up to 75% on 2GB/3GB RAM phones.
+        if (rawDecoded != null && !rawDecoded.isRecycled) {
+            val maxSide = max(rawDecoded.width, rawDecoded.height)
+            if (maxSide > targetDim) {
+                val ratio = targetDim.toFloat() / maxSide.toFloat()
+                val scaledW = (rawDecoded.width * ratio).roundToInt().coerceAtLeast(16)
+                val scaledH = (rawDecoded.height * ratio).roundToInt().coerceAtLeast(16)
+                val resized = runCatching {
+                    Bitmap.createScaledBitmap(rawDecoded, scaledW, scaledH, true)
+                }.getOrNull()
+                if (resized != null && resized !== rawDecoded) {
+                    rawDecoded.recycle()
+                    rawDecoded = resized
+                }
+            }
         }
-        return decoded
+
+        if (rawDecoded != null && !rawDecoded.isRecycled) {
+            synchronized(sourceBitmapCache) {
+                sourceBitmapCache.put(cacheKey, rawDecoded)
+            }
+        }
+        return rawDecoded
     }
 
-    private fun computeInSampleSize(rawW: Int, rawH: Int, maxDim: Int): Int {
+    fun computeInSampleSize(rawW: Int, rawH: Int, maxDim: Int): Int {
+        if (rawW <= 0 || rawH <= 0 || maxDim <= 0) return 1
         var inSampleSize = 1
         val maxRaw = max(rawW, rawH)
         while (maxRaw / (inSampleSize * 2) >= maxDim) {
@@ -896,14 +969,19 @@ object ImageProcessingEngine {
         maxEdge: Int,
         includePreviewGuides: Boolean = false
     ): Bitmap = withContext(Dispatchers.Default) {
+        val effectiveMaxEdge = if (includePreviewGuides) {
+            maxEdge.coerceIn(64, MAX_PREVIEW_DIMENSION_PX)
+        } else {
+            maxEdge.coerceIn(64, MAX_EXPORT_DIMENSION_PX)
+        }
         val targetW: Int
         val targetH: Int
         val aspect = state.canvasWidth.toFloat() / state.canvasHeight.toFloat().coerceAtLeast(1f)
         if (aspect >= 1f) {
-            targetW = min(state.canvasWidth, maxEdge)
+            targetW = min(state.canvasWidth, effectiveMaxEdge)
             targetH = (targetW / aspect).roundToInt().coerceAtLeast(64)
         } else {
-            targetH = min(state.canvasHeight, maxEdge)
+            targetH = min(state.canvasHeight, effectiveMaxEdge)
             targetW = (targetH * aspect).roundToInt().coerceAtLeast(64)
         }
 
@@ -930,7 +1008,8 @@ object ImageProcessingEngine {
                         context = context,
                         uriString = layer.imageUri,
                         fallbackDrawable = layer.fallbackDrawable,
-                        maxDimension = max(targetW, targetH)
+                        maxDimension = max(targetW, targetH),
+                        isExport = !includePreviewGuides
                     ) ?: continue
 
                     var processed = decoded
@@ -1412,7 +1491,7 @@ object ImageProcessingEngine {
         targetFormat: ImageConvertFormat,
         quality: Int
     ): ExportResult = withContext(Dispatchers.IO) {
-        val bmp = decodeSampledBitmap(context, uriString, null, 2048)
+        val bmp = decodeSampledBitmap(context, uriString, null, MAX_EXPORT_DIMENSION_PX, isExport = true)
             ?: return@withContext ExportResult(false, "", 0L, "Unable to decode source image")
         try {
             val baos = ByteArrayOutputStream()
@@ -1569,11 +1648,11 @@ object ImageProcessingEngine {
             // 1b. Optional Outgoing Clip Backdrop during Multi-Clip Transitions
             if (previousFrame != null && !previousFrame.isRecycled) {
                 val prevFit = min(targetW.toFloat() / previousFrame.width, targetH.toFloat() / previousFrame.height)
-                val prevScale = prevFit * cropZoom.coerceIn(0.25f, 3.0f)
+                val prevScale = prevFit * cropZoom.coerceIn(0.25f, 4.0f)
                 val prevW = previousFrame.width * prevScale
                 val prevH = previousFrame.height * prevScale
-                val prevCx = clampFrameCenter(targetW / 2f + panX * targetW * 0.4f, prevW, targetW.toFloat())
-                val prevCy = clampFrameCenter(targetH / 2f + panY * targetH * 0.4f, prevH, targetH.toFloat())
+                val prevCx = targetW / 2f + panX * targetW * 0.5f
+                val prevCy = targetH / 2f + panY * targetH * 0.5f
                 canvas.drawBitmap(
                     previousFrame,
                     null,
@@ -1601,19 +1680,11 @@ object ImageProcessingEngine {
 
                 val stabilizeBoost = if (stabilizeEnabled) 1.09f else 1f
                 val baseFit = min(targetW.toFloat() / sourceFrame.width, targetH.toFloat() / sourceFrame.height)
-                val baseScale = baseFit * cropZoom.coerceIn(0.25f, 3.0f) * keyframeScale.coerceIn(0.2f, 3.0f) * stabilizeBoost
+                val baseScale = baseFit * cropZoom.coerceIn(0.25f, 4.0f) * keyframeScale.coerceIn(0.2f, 4.0f) * stabilizeBoost
                 val baseDrawW = sourceFrame.width * baseScale
                 val baseDrawH = sourceFrame.height * baseScale
-                val clampedBaseCx = clampFrameCenter(
-                    targetW / 2f + (panX + keyframeX) * targetW * 0.4f,
-                    baseDrawW,
-                    targetW.toFloat()
-                )
-                val clampedBaseCy = clampFrameCenter(
-                    targetH / 2f + (panY + keyframeY) * targetH * 0.4f,
-                    baseDrawH,
-                    targetH.toFloat()
-                )
+                val clampedBaseCx = targetW / 2f + (panX + keyframeX) * targetW * 0.5f
+                val clampedBaseCy = targetH / 2f + (panY + keyframeY) * targetH * 0.5f
 
                 val drawW = baseDrawW * transitionScale
                 val drawH = baseDrawH * transitionScale

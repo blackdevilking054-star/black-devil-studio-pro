@@ -19,10 +19,12 @@ import com.example.data.UserAuthRepository
 import com.example.data.WorkspaceType
 import com.example.data.XonixDatabase
 import com.example.engine.AudioDspEngine
+import com.example.engine.ExoVideoPlaybackController
 import com.example.engine.ExportResult
 import com.example.engine.ImageProcessingEngine
 import com.example.engine.MediaExportStore
 import com.example.engine.StickerCatalogItem
+import com.example.engine.TimelineThumbnailCache
 import com.example.engine.VideoMediaEngine
 import com.example.engine.VideoOverlayRenderer
 import com.example.model.AudioEqPreset
@@ -159,11 +161,18 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
     private val _videoState = MutableStateFlow(createInitialVideoState())
     val videoState: StateFlow<VideoEditorState> = _videoState.asStateFlow()
 
+    // Decoupled 60fps live playhead flow: updated during playback & scrubbing without triggering
+    // full-screen Compose recompositions of VideoEditorWorkspace.
+    private val _livePlayheadMs = MutableStateFlow(0L)
+    val livePlayheadMs: StateFlow<Long> = _livePlayheadMs.asStateFlow()
+
     private val _videoPreviewBitmap = MutableStateFlow<Bitmap?>(null)
     val videoPreviewBitmap: StateFlow<Bitmap?> = _videoPreviewBitmap.asStateFlow()
 
     private val _clipThumbnails = MutableStateFlow<Map<String, List<Bitmap>>>(emptyMap())
     val clipThumbnails: StateFlow<Map<String, List<Bitmap>>> = _clipThumbnails.asStateFlow()
+
+    private var scrubSoftwareRenderJob: Job? = null
 
     // Video Editor Undo / Redo History Stack
     private val videoUndoStack = ArrayDeque<VideoEditorState>()
@@ -518,7 +527,7 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
         )
         return VideoEditorState(
             clips = listOf(clip1, clip2),
-            selectedClipId = clip1.id,
+            selectedClipId = null,
             aspectPreset = VideoAspectPreset.YOUTUBE_16_9,
             pip = PipOverlayState(
                 enabled = false,
@@ -527,21 +536,44 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
                 label = "Overlay"
             ),
             textLayers = listOf(titleOverlay),
-            selectedTextId = titleOverlay.id
+            selectedTextId = null
         )
     }
 
     private fun refreshFilmstripThumbnails(clips: List<VideoClip>) {
-        viewModelScope.launch(Dispatchers.IO) {
-            val existing = _clipThumbnails.value
-            val activeIds = clips.map { it.id }.toSet()
-            val updated = existing.filterKeys { it in activeIds }.toMutableMap()
-            clips.forEach { clip ->
-                if (updated[clip.id].isNullOrEmpty()) {
-                    updated[clip.id] = VideoMediaEngine.extractFilmstripThumbnails(appContext, clip, count = 5)
+        // 1. Instant cache-hit pass so already-cached RGB_565 thumbnails appear with zero flicker
+        val existing = _clipThumbnails.value
+        val activeIds = clips.map { it.id }.toSet()
+        val immediate = existing.filterKeys { it in activeIds }.toMutableMap()
+        val missingClips = ArrayList<VideoClip>()
+        clips.forEach { clip ->
+            val current = immediate[clip.id]
+            if (current.isNullOrEmpty() || current.any { it.isRecycled }) {
+                val cached = TimelineThumbnailCache.getCachedFilmstrip(clip, count = 5)
+                if (cached != null) {
+                    immediate[clip.id] = cached
+                } else {
+                    missingClips.add(clip)
                 }
             }
-            _clipThumbnails.value = updated
+        }
+        _clipThumbnails.value = immediate
+        if (missingClips.isEmpty()) return
+
+        // 2. Decode missing 120x120px RGB_565 thumbnails asynchronously on Dispatchers.IO
+        viewModelScope.launch(Dispatchers.IO) {
+            for (clip in missingClips) {
+                val decoded = TimelineThumbnailCache.loadFilmstripAsync(appContext, clip, count = 5)
+                if (decoded.isNotEmpty()) {
+                    _clipThumbnails.update { currentMap ->
+                        if (_videoState.value.clips.any { it.id == clip.id }) {
+                            currentMap + (clip.id to decoded)
+                        } else {
+                            currentMap
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -554,9 +586,17 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
                 val isFastImmediate = videoRenderImmediate.getAndSet(false)
                 if (!isFastImmediate) delay(8L)
                 val snapshot = _videoState.value
+                val activeClip = findClipAtTimelineMs(snapshot.clips, snapshot.playheadMs)
+                val useGpuTransform = VideoMediaEngine.canUseGpuPreviewTransform(snapshot, activeClip)
                 val targetEdge = if (snapshot.isPlaying || !isFastImmediate) 600 else 720
                 val rendered = withContext(Dispatchers.Default) {
-                    VideoMediaEngine.renderPreviewAtPlayhead(appContext, snapshot, maxEdge = targetEdge)
+                    VideoMediaEngine.renderPreviewAtPlayhead(
+                        context = appContext,
+                        state = snapshot,
+                        maxEdge = targetEdge,
+                        bakeVideoTransform = !useGpuTransform,
+                        bakeOverlays = !useGpuTransform
+                    )
                 }
                 _videoSourceAspect.value = VideoMediaEngine.lastRenderedSourceAspect
                 _videoPreviewBitmap.value = rendered
@@ -793,13 +833,24 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
         scheduleAutoSave(WorkspaceType.VIDEO)
     }
 
-    private fun findClipAtPlayhead(s: VideoEditorState): Triple<Int, VideoClip, Long>? {
+    private fun currentExactPlayheadMs(s: VideoEditorState): Long {
+        val maxMs = maxOf(
+            s.totalDurationMs,
+            s.textLayers.maxOfOrNull { it.endMs } ?: 0L
+        ).coerceAtLeast(0L)
+        return _livePlayheadMs.value.coerceIn(0L, maxMs)
+    }
+
+    private fun findClipAtPlayhead(
+        s: VideoEditorState,
+        playheadMs: Long = currentExactPlayheadMs(s)
+    ): Triple<Int, VideoClip, Long>? {
         if (s.clips.isEmpty()) return null
         var acc = 0L
         s.clips.forEachIndexed { idx, clip ->
             val dur = clip.effectiveDurationMs
-            if (s.playheadMs <= acc + dur || idx == s.clips.lastIndex) {
-                val localMs = (s.playheadMs - acc).coerceIn(0L, dur)
+            if (playheadMs <= acc + dur || idx == s.clips.lastIndex) {
+                val localMs = (playheadMs - acc).coerceIn(0L, dur)
                 return Triple(idx, clip, localMs)
             }
             acc += dur
@@ -1371,29 +1422,31 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
 
     fun getSelectedClipLocalTimeMs(): Long {
         val s = _videoState.value
-        val hit = findClipAtPlayhead(s)
+        val exactMs = currentExactPlayheadMs(s)
+        val hit = findClipAtPlayhead(s, exactMs)
         if (hit != null && (s.selectedClipId == null || hit.second.id == s.selectedClipId)) {
             return hit.third
         }
         val target = s.selectedClip ?: return 0L
         val offset = getClipStartMs(s, target.id)
-        return (s.playheadMs - offset).coerceIn(0L, target.effectiveDurationMs)
+        return (exactMs - offset).coerceIn(0L, target.effectiveDurationMs)
     }
 
     /**
      * CapCut / VN single-tap Keyframe Toggle (`◆+` / `◆-`) for the active Video, Text, or Sticker layer.
      * - If a keyframe already exists at the current playhead (±45ms), removes it.
      * - Otherwise captures the layer's exact current transform (`offsetX`, `offsetY`, `scale`, `rotation`, `opacity`)
-     *   and inserts a sorted Keyframe at the current playhead timestamp.
+     *   and inserts a sorted Keyframe at the exact current playhead timestamp.
      */
     fun toggleKeyframeAtPlayhead() {
         val snapshot = _videoState.value
+        val exactMs = currentExactPlayheadMs(snapshot)
         val selOverlay = snapshot.selectedTextId?.let { id ->
             snapshot.textLayers.firstOrNull { it.id == id }
         }
         if (selOverlay != null) {
             val dur = (selOverlay.endMs - selOverlay.startMs).coerceAtLeast(1L)
-            val localMs = (snapshot.playheadMs - selOverlay.startMs).coerceIn(0L, dur)
+            val localMs = (exactMs - selOverlay.startMs).coerceIn(0L, dur)
             val existingIdx = selOverlay.keyframes.indexOfFirst {
                 kotlin.math.abs(it.timeMs - localMs) <= KEYFRAME_MATCH_TOLERANCE_MS
             }
@@ -1402,6 +1455,7 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
                 val removeId = selOverlay.keyframes[existingIdx].id
                 _videoState.update { s ->
                     s.copy(
+                        playheadMs = exactMs.coerceIn(0L, maxOf(s.totalDurationMs, selOverlay.endMs)),
                         textLayers = s.textLayers.map { layer ->
                             if (layer.id == selOverlay.id) {
                                 layer.copy(keyframes = layer.keyframes.filterNot { it.id == removeId })
@@ -1412,9 +1466,11 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
                 showToast("Keyframe removed")
             } else {
                 val eff = VideoOverlayRenderer.resolveOverlayTransformAt(selOverlay, selOverlay.startMs + localMs)
+                val syncedGlobalMs = (selOverlay.startMs + localMs).coerceIn(0L, maxOf(snapshot.totalDurationMs, selOverlay.endMs))
+                _livePlayheadMs.value = syncedGlobalMs
                 _videoState.update { s ->
                     s.copy(
-                        playheadMs = (selOverlay.startMs + localMs).coerceIn(0L, maxOf(s.totalDurationMs, selOverlay.endMs)),
+                        playheadMs = syncedGlobalMs,
                         textLayers = s.textLayers.map { layer ->
                             if (layer.id == selOverlay.id) {
                                 layer.copy(
@@ -1440,7 +1496,7 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
         }
 
         // Video clip target
-        val hit = findClipAtPlayhead(snapshot) ?: return
+        val hit = findClipAtPlayhead(snapshot, exactMs) ?: return
         val (_, targetClip, exactLocalMs) = hit
         val existingIdx = targetClip.keyframes.indexOfFirst {
             kotlin.math.abs(it.timeMs - exactLocalMs) <= KEYFRAME_MATCH_TOLERANCE_MS
@@ -1450,6 +1506,7 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
             val removeId = targetClip.keyframes[existingIdx].id
             _videoState.update { s ->
                 s.copy(
+                    playheadMs = exactMs.coerceIn(0L, s.totalDurationMs),
                     clips = s.clips.map { clip ->
                         if (clip.id == targetClip.id) {
                             clip.copy(keyframes = clip.keyframes.filterNot { it.id == removeId })
@@ -1468,19 +1525,20 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
             if (targetClip.keyframes.isEmpty()) {
                 curX = snapshot.panX.coerceIn(-1f, 1f)
                 curY = snapshot.panY.coerceIn(-1f, 1f)
-                curScale = snapshot.cropZoom.coerceIn(0.25f, 3.0f)
+                curScale = snapshot.cropZoom.coerceIn(0.25f, 4.0f)
                 curRot = targetClip.rotationDeg
                 curOpacity = 1f
             } else {
                 val interp = VideoMediaEngine.interpolateKeyframes(targetClip.keyframes, exactLocalMs)
                 curX = interp.xNorm
                 curY = interp.yNorm
-                curScale = interp.scale
+                curScale = interp.scale.coerceIn(0.25f, 4.0f)
                 curRot = interp.rotationDeg
                 curOpacity = interp.opacity
             }
             _videoState.update { s ->
                 s.copy(
+                    playheadMs = exactMs.coerceIn(0L, s.totalDurationMs),
                     clips = s.clips.map { clip ->
                         if (clip.id == targetClip.id) {
                             clip.copy(
@@ -1501,7 +1559,11 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
             }
             showToast("Keyframe added")
         }
-        scheduleVideoPreviewRender(true)
+        val latest = _videoState.value
+        val activeAtPlayhead = findClipAtTimelineMs(latest.clips, exactMs)
+        if (!VideoMediaEngine.canUseGpuPreviewTransform(latest, activeAtPlayhead)) {
+            scheduleVideoPreviewRender(true)
+        }
         scheduleAutoSave(WorkspaceType.VIDEO)
     }
 
@@ -1514,16 +1576,18 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
         easing: KeyframeEasing? = null
     ) {
         val snapshot = _videoState.value
+        val exactMs = currentExactPlayheadMs(snapshot)
         val isSliderUpdate = xNorm != null || yNorm != null || scale != null || rotationDeg != null || opacity != null
         val selOverlay = snapshot.selectedTextId?.let { id ->
             snapshot.textLayers.firstOrNull { it.id == id }
         }
         if (selOverlay != null) {
             val dur = (selOverlay.endMs - selOverlay.startMs).coerceAtLeast(1L)
-            val localMs = (snapshot.playheadMs - selOverlay.startMs).coerceIn(0L, dur)
+            val localMs = (exactMs - selOverlay.startMs).coerceIn(0L, dur)
             recordVideoUndoSnapshot(coalesceTag = if (isSliderUpdate) "kf_overlay_slider" else null)
             _videoState.update { s ->
                 s.copy(
+                    playheadMs = exactMs.coerceIn(0L, maxOf(s.totalDurationMs, selOverlay.endMs)),
                     textLayers = s.textLayers.map { layer ->
                         if (layer.id != selOverlay.id) return@map layer
                         val eff = VideoOverlayRenderer.resolveOverlayTransformAt(layer, layer.startMs + localMs)
@@ -1552,12 +1616,16 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
                     }
                 )
             }
-            scheduleVideoPreviewRender(true)
+            val latest = _videoState.value
+            val activeAtPlayhead = findClipAtTimelineMs(latest.clips, exactMs)
+            if (!VideoMediaEngine.canUseGpuPreviewTransform(latest, activeAtPlayhead)) {
+                scheduleVideoPreviewRender(true)
+            }
             scheduleAutoSave(WorkspaceType.VIDEO)
             return
         }
 
-        val hit = findClipAtPlayhead(snapshot) ?: return
+        val hit = findClipAtPlayhead(snapshot, exactMs) ?: return
         val (_, targetClip, exactLocalMs) = hit
         recordVideoUndoSnapshot(coalesceTag = if (isSliderUpdate) "kf_slider" else null)
 
@@ -1572,14 +1640,14 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
                 if (clip.keyframes.isEmpty()) {
                     baseX = s.panX.coerceIn(-1f, 1f)
                     baseY = s.panY.coerceIn(-1f, 1f)
-                    baseScale = s.cropZoom.coerceIn(0.25f, 3.0f)
+                    baseScale = s.cropZoom.coerceIn(0.25f, 4.0f)
                     baseRot = clip.rotationDeg
                     baseOpacity = 1f
                 } else {
                     val interp = VideoMediaEngine.interpolateKeyframes(clip.keyframes, exactLocalMs)
                     baseX = interp.xNorm
                     baseY = interp.yNorm
-                    baseScale = interp.scale
+                    baseScale = interp.scale.coerceIn(0.25f, 4.0f)
                     baseRot = interp.rotationDeg
                     baseOpacity = interp.opacity
                 }
@@ -1589,27 +1657,36 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
                         localMs = exactLocalMs,
                         xNorm = (xNorm ?: baseX).coerceIn(-1f, 1f),
                         yNorm = (yNorm ?: baseY).coerceIn(-1f, 1f),
-                        scale = (scale ?: baseScale).coerceIn(0.25f, 3.0f),
+                        scale = (scale ?: baseScale).coerceIn(0.25f, 4.0f),
                         rotationDeg = rotationDeg ?: baseRot,
                         opacity = (opacity ?: baseOpacity).coerceIn(0f, 1f),
                         easing = easing
                     )
                 )
             }
-            s.copy(clips = nextClips, selectedClipId = targetClip.id)
+            s.copy(
+                playheadMs = exactMs.coerceIn(0L, s.totalDurationMs),
+                clips = nextClips,
+                selectedClipId = targetClip.id
+            )
         }
-        scheduleVideoPreviewRender(true)
+        val latest = _videoState.value
+        val activeAtPlayhead = findClipAtTimelineMs(latest.clips, exactMs)
+        if (!VideoMediaEngine.canUseGpuPreviewTransform(latest, activeAtPlayhead)) {
+            scheduleVideoPreviewRender(true)
+        }
         scheduleAutoSave(WorkspaceType.VIDEO)
     }
 
     fun setKeyframeSegmentEasing(easing: KeyframeEasing) {
         val snapshot = _videoState.value
+        val exactMs = currentExactPlayheadMs(snapshot)
         val selOverlay = snapshot.selectedTextId?.let { id ->
             snapshot.textLayers.firstOrNull { it.id == id }
         }
         if (selOverlay != null) {
             val dur = (selOverlay.endMs - selOverlay.startMs).coerceAtLeast(1L)
-            val localMs = (snapshot.playheadMs - selOverlay.startMs).coerceIn(0L, dur)
+            val localMs = (exactMs - selOverlay.startMs).coerceIn(0L, dur)
             val seg = VideoMediaEngine.findActiveKeyframeSegment(selOverlay.keyframes, localMs) ?: return
             recordVideoUndoSnapshot()
             _videoState.update { s ->
@@ -1631,7 +1708,7 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
             return
         }
 
-        val hit = findClipAtPlayhead(snapshot) ?: return
+        val hit = findClipAtPlayhead(snapshot, exactMs) ?: return
         val (_, targetClip, localMs) = hit
         val seg = VideoMediaEngine.findActiveKeyframeSegment(targetClip.keyframes, localMs) ?: return
         recordVideoUndoSnapshot()
@@ -1655,19 +1732,20 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
 
     fun jumpToPreviousKeyframe() {
         val s = _videoState.value
+        val exactMs = currentExactPlayheadMs(s)
         val selOverlay = s.selectedTextId?.let { id -> s.textLayers.firstOrNull { it.id == id } }
         if (selOverlay != null) {
-            val localMs = s.playheadMs - selOverlay.startMs
+            val localMs = exactMs - selOverlay.startMs
             val prev = selOverlay.keyframes
                 .sortedBy { it.timeMs }
                 .lastOrNull { it.timeMs < localMs - KEYFRAME_MATCH_TOLERANCE_MS } ?: return
             seekPlayhead((selOverlay.startMs + prev.timeMs).coerceIn(0L, maxOf(s.totalDurationMs, selOverlay.endMs)))
             return
         }
-        val hit = findClipAtPlayhead(s)
+        val hit = findClipAtPlayhead(s, exactMs)
         val clip = hit?.second ?: s.selectedClip ?: return
         val clipStart = getClipStartMs(s, clip.id)
-        val localMs = s.playheadMs - clipStart
+        val localMs = exactMs - clipStart
         val prev = clip.keyframes
             .sortedBy { it.timeMs }
             .lastOrNull { it.timeMs < localMs - KEYFRAME_MATCH_TOLERANCE_MS } ?: return
@@ -1676,19 +1754,20 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
 
     fun jumpToNextKeyframe() {
         val s = _videoState.value
+        val exactMs = currentExactPlayheadMs(s)
         val selOverlay = s.selectedTextId?.let { id -> s.textLayers.firstOrNull { it.id == id } }
         if (selOverlay != null) {
-            val localMs = s.playheadMs - selOverlay.startMs
+            val localMs = exactMs - selOverlay.startMs
             val next = selOverlay.keyframes
                 .sortedBy { it.timeMs }
                 .firstOrNull { it.timeMs > localMs + KEYFRAME_MATCH_TOLERANCE_MS } ?: return
             seekPlayhead((selOverlay.startMs + next.timeMs).coerceIn(0L, maxOf(s.totalDurationMs, selOverlay.endMs)))
             return
         }
-        val hit = findClipAtPlayhead(s)
+        val hit = findClipAtPlayhead(s, exactMs)
         val clip = hit?.second ?: s.selectedClip ?: return
         val clipStart = getClipStartMs(s, clip.id)
-        val localMs = s.playheadMs - clipStart
+        val localMs = exactMs - clipStart
         val next = clip.keyframes
             .sortedBy { it.timeMs }
             .firstOrNull { it.timeMs > localMs + KEYFRAME_MATCH_TOLERANCE_MS } ?: return
@@ -1854,10 +1933,89 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
         showToast("Custom sticker imported")
     }
 
+    private fun findClipAtTimelineMs(clips: List<VideoClip>, timelineMs: Long): VideoClip? {
+        if (clips.isEmpty()) return null
+        var acc = 0L
+        for (i in clips.indices) {
+            val clip = clips[i]
+            val dur = clip.effectiveDurationMs
+            if (timelineMs <= acc + dur || i == clips.lastIndex) {
+                return clip
+            }
+            acc += dur
+        }
+        return clips.lastOrNull()
+    }
+
     fun seekPlayhead(ms: Long) {
         fxPreviewJob?.cancel()
-        _videoState.update { it.copy(playheadMs = ms.coerceIn(0L, it.totalDurationMs)) }
+        scrubSoftwareRenderJob?.cancel()
+        val clamped = ms.coerceIn(0L, _videoState.value.totalDurationMs)
+        _livePlayheadMs.value = clamped
+        _videoState.update { it.copy(playheadMs = clamped) }
         scheduleVideoPreviewRender(immediate = true)
+    }
+
+    /**
+     * Zero-recomposition timeline scrub update.
+     * Updates [_livePlayheadMs] without mutating [_videoState] on every drag pixel so the
+     * VideoEditorWorkspace never freezes or drops frames while dragging the timeline or seekbar.
+     */
+    fun updateLivePlayheadScrub(ms: Long, renderSoftwarePreview: Boolean) {
+        fxPreviewJob?.cancel()
+        val s = _videoState.value
+        val clamped = ms.coerceIn(0L, s.totalDurationMs)
+        _livePlayheadMs.value = clamped
+        if (!renderSoftwarePreview) return
+        val activeClip = findClipAtTimelineMs(s.clips, clamped)
+        val useGpuTransform = VideoMediaEngine.canUseGpuPreviewTransform(s, activeClip)
+        // Static starter clip with GPU Keyframe graphicsLayer needs zero CPU re-render while scrubbing inside same clip
+        if (useGpuTransform &&
+            activeClip != null &&
+            activeClip.uriString.isNullOrBlank() &&
+            activeClip.transitionAfter == VideoTransition.NONE &&
+            _videoPreviewBitmap.value != null
+        ) {
+            return
+        }
+        if (scrubSoftwareRenderJob?.isActive == true) return
+        scrubSoftwareRenderJob = viewModelScope.launch {
+            delay(16L)
+            val targetMs = _livePlayheadMs.value
+            val snap = _videoState.value
+            val clipAtTarget = findClipAtTimelineMs(snap.clips, targetMs)
+            val gpuMode = VideoMediaEngine.canUseGpuPreviewTransform(snap, clipAtTarget)
+            val rendered = withContext(Dispatchers.Default) {
+                VideoMediaEngine.renderPreviewAtPlayhead(
+                    context = appContext,
+                    state = snap.copy(playheadMs = targetMs),
+                    maxEdge = 480,
+                    bakeVideoTransform = !gpuMode,
+                    bakeOverlays = !gpuMode
+                )
+            }
+            _videoSourceAspect.value = VideoMediaEngine.lastRenderedSourceAspect
+            _videoPreviewBitmap.value = rendered
+        }
+    }
+
+    /**
+     * Commits the final scrubbed playhead timestamp into [_videoState] once the user finishes
+     * dragging, keeping Keyframe buttons, bounding boxes, and inspector controls exact.
+     */
+    fun commitPlayheadPosition(ms: Long) {
+        scrubSoftwareRenderJob?.cancel()
+        val clamped = ms.coerceIn(0L, _videoState.value.totalDurationMs)
+        _livePlayheadMs.value = clamped
+        val prev = _videoState.value.playheadMs
+        if (prev != clamped) {
+            _videoState.update { it.copy(playheadMs = clamped) }
+        }
+        val snap = _videoState.value
+        val activeClip = findClipAtTimelineMs(snap.clips, clamped)
+        if (!ExoVideoPlaybackController.canUseHardwareExoSurface(snap, activeClip)) {
+            scheduleVideoPreviewRender(immediate = true)
+        }
     }
 
     fun selectClipTransition(transition: VideoTransition) {
@@ -1889,9 +2047,19 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
                 var curMs = previewStartMs
                 while (isActive && curMs <= previewEndMs) {
                     val t0 = SystemClock.elapsedRealtime()
-                    _videoState.update { it.copy(playheadMs = curMs.coerceIn(0L, it.totalDurationMs)) }
+                    val clamped = curMs.coerceIn(0L, _videoState.value.totalDurationMs)
+                    _livePlayheadMs.value = clamped
+                    val snap = _videoState.value
+                    val clipAt = findClipAtTimelineMs(snap.clips, clamped)
+                    val gpuMode = VideoMediaEngine.canUseGpuPreviewTransform(snap, clipAt)
                     val rendered = withContext(Dispatchers.Default) {
-                        VideoMediaEngine.renderPreviewAtPlayhead(appContext, _videoState.value, maxEdge = 540)
+                        VideoMediaEngine.renderPreviewAtPlayhead(
+                            context = appContext,
+                            state = snap.copy(playheadMs = clamped),
+                            maxEdge = 540,
+                            bakeVideoTransform = !gpuMode,
+                            bakeOverlays = !gpuMode
+                        )
                     }
                     _videoSourceAspect.value = VideoMediaEngine.lastRenderedSourceAspect
                     _videoPreviewBitmap.value = rendered
@@ -1900,54 +2068,114 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
                     delay(waitMs)
                     curMs += (elapsed + waitMs).coerceIn(28L, 80L)
                 }
+                _videoState.update { it.copy(playheadMs = _livePlayheadMs.value.coerceIn(0L, it.totalDurationMs)) }
             }
         }
     }
 
     fun toggleVideoPlayback() {
         fxPreviewJob?.cancel()
+        scrubSoftwareRenderJob?.cancel()
         if (_videoState.value.isPlaying) {
             stopVideoPlayback()
         } else {
-            if (_videoState.value.clips.isEmpty()) {
+            val initial = _videoState.value
+            if (initial.clips.isEmpty()) {
                 showToast("Add a video clip to play")
                 return
             }
-            _videoState.update { it.copy(isPlaying = true) }
+            val startMs = if (initial.playheadMs >= initial.totalDurationMs) 0L else initial.playheadMs
+            _livePlayheadMs.value = startMs
+            _videoState.update { it.copy(isPlaying = true, playheadMs = startMs) }
             playbackJob?.cancel()
             playbackJob = viewModelScope.launch {
                 val targetStepMs = 16L
                 var lastTickMs = SystemClock.elapsedRealtime()
+                var currentMs = startMs
+                var lastActiveClipId = findClipAtTimelineMs(_videoState.value.clips, currentMs)?.id
+
                 while (isActive && _videoState.value.isPlaying) {
                     val nowMs = SystemClock.elapsedRealtime()
                     val deltaMs = (nowMs - lastTickMs).coerceIn(8L, 64L)
                     lastTickMs = nowMs
                     val s = _videoState.value
-                    val next = s.playheadMs + deltaMs
-                    if (next >= s.totalDurationMs) {
+                    val totalDur = s.totalDurationMs.coerceAtLeast(1L)
+                    val next = currentMs + deltaMs
+
+                    if (next >= totalDur) {
                         if (s.loopPlayback) {
+                            currentMs = 0L
+                            _livePlayheadMs.value = 0L
+                            lastActiveClipId = findClipAtTimelineMs(s.clips, 0L)?.id
+                            // Sync clip boundary/loop reset once without per-frame state churn
                             _videoState.update { it.copy(playheadMs = 0L) }
+                            delay(targetStepMs)
+                            continue
                         } else {
-                            _videoState.update { it.copy(isPlaying = false, playheadMs = s.totalDurationMs) }
-                            val finalBmp = withContext(Dispatchers.Default) {
-                                VideoMediaEngine.renderPreviewAtPlayhead(appContext, _videoState.value, maxEdge = 640)
+                            currentMs = totalDur
+                            _livePlayheadMs.value = totalDur
+                            _videoState.update { it.copy(isPlaying = false, playheadMs = totalDur) }
+                            val activeAtEnd = findClipAtTimelineMs(s.clips, totalDur)
+                            if (!ExoVideoPlaybackController.canUseHardwareExoSurface(s, activeAtEnd)) {
+                                val gpuMode = VideoMediaEngine.canUseGpuPreviewTransform(s, activeAtEnd)
+                                val finalBmp = withContext(Dispatchers.Default) {
+                                    VideoMediaEngine.renderPreviewAtPlayhead(
+                                        context = appContext,
+                                        state = _videoState.value,
+                                        maxEdge = 640,
+                                        bakeVideoTransform = !gpuMode,
+                                        bakeOverlays = !gpuMode
+                                    )
+                                }
+                                _videoSourceAspect.value = VideoMediaEngine.lastRenderedSourceAspect
+                                _videoPreviewBitmap.value = finalBmp
                             }
-                            _videoSourceAspect.value = VideoMediaEngine.lastRenderedSourceAspect
-                            _videoPreviewBitmap.value = finalBmp
                             break
                         }
+                    }
+
+                    currentMs = next
+                    // Decoupled 60fps progress update: does NOT trigger full-screen Compose recomposition
+                    _livePlayheadMs.value = currentMs
+
+                    val activeClip = findClipAtTimelineMs(s.clips, currentMs)
+                    val switchedClip = activeClip?.id != lastActiveClipId
+                    if (switchedClip) {
+                        lastActiveClipId = activeClip?.id
+                        // Sync state once only when crossing into a different clip so ExoPlayer switches media cleanly
+                        _videoState.update { it.copy(playheadMs = currentMs) }
+                    }
+
+                    val gpuMode = VideoMediaEngine.canUseGpuPreviewTransform(s, activeClip)
+                    val staticStarterGpuOnly = gpuMode &&
+                        activeClip != null &&
+                        activeClip.uriString.isNullOrBlank() &&
+                        activeClip.transitionAfter == VideoTransition.NONE &&
+                        !switchedClip &&
+                        _videoPreviewBitmap.value != null
+
+                    if (ExoVideoPlaybackController.canUseHardwareExoSurface(s, activeClip) || staticStarterGpuOnly) {
+                        // Hardware ExoPlayer GPU TextureView OR static starter clip + Compose 60fps graphicsLayer
+                        // drive silky 60fps Keyframe zoom, pan, rotate, opacity with ZERO CPU lag!
+                        delay(targetStepMs)
                     } else {
-                        _videoState.update { it.copy(playheadMs = next) }
+                        // Software compositor fallback (pixel LUT, chroma PIP, glitch FX, real video with filter)
+                        val renderStart = SystemClock.elapsedRealtime()
+                        val rendered = withContext(Dispatchers.Default) {
+                            VideoMediaEngine.renderPreviewAtPlayhead(
+                                context = appContext,
+                                state = s.copy(playheadMs = currentMs),
+                                maxEdge = 500,
+                                bakeVideoTransform = !gpuMode,
+                                bakeOverlays = !gpuMode
+                            )
+                        }
+                        _videoSourceAspect.value = VideoMediaEngine.lastRenderedSourceAspect
+                        _videoPreviewBitmap.value = rendered
+                        val renderElapsed = SystemClock.elapsedRealtime() - renderStart
+                        val sleepMs = (targetStepMs - renderElapsed).coerceAtLeast(4L)
+                        delay(sleepMs)
                     }
-                    val renderStart = SystemClock.elapsedRealtime()
-                    val rendered = withContext(Dispatchers.Default) {
-                        VideoMediaEngine.renderPreviewAtPlayhead(appContext, _videoState.value, maxEdge = 540)
-                    }
-                    _videoSourceAspect.value = VideoMediaEngine.lastRenderedSourceAspect
-                    _videoPreviewBitmap.value = rendered
-                    val renderElapsed = SystemClock.elapsedRealtime() - renderStart
-                    val sleepMs = (targetStepMs - renderElapsed).coerceAtLeast(4L)
-                    delay(sleepMs)
                 }
             }
         }
@@ -1955,8 +2183,11 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
 
     fun stopVideoPlayback() {
         fxPreviewJob?.cancel()
+        scrubSoftwareRenderJob?.cancel()
         playbackJob?.cancel()
-        _videoState.update { it.copy(isPlaying = false) }
+        val finalMs = _livePlayheadMs.value.coerceIn(0L, _videoState.value.totalDurationMs)
+        _videoState.update { it.copy(isPlaying = false, playheadMs = finalMs) }
+        scheduleVideoPreviewRender(immediate = true)
     }
 
     fun toggleLoopPlayback() {
@@ -1987,13 +2218,14 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
     fun updateVideoFraming(zoom: Float? = null, panX: Float? = null, panY: Float? = null, blurredBg: Boolean? = null) {
         recordVideoUndoSnapshot(coalesceTag = "framing")
         _videoState.update { s ->
-            val hit = findClipAtPlayhead(s)
+            val exactMs = currentExactPlayheadMs(s)
+            val hit = findClipAtPlayhead(s, exactMs)
             val activeClip = hit?.second
             val transformChanged = zoom != null || panX != null || panY != null
             if (activeClip != null && activeClip.keyframes.isNotEmpty() && transformChanged) {
                 val localMs = hit.third
                 val interp = VideoMediaEngine.interpolateKeyframes(activeClip.keyframes, localMs)
-                val nextZoom = (zoom ?: interp.scale).coerceIn(0.25f, 3.0f)
+                val nextZoom = (zoom ?: interp.scale).coerceIn(0.25f, 4.0f)
                 val nextX = (panX ?: interp.xNorm).coerceIn(-1f, 1f)
                 val nextY = (panY ?: interp.yNorm).coerceIn(-1f, 1f)
                 val nextClips = s.clips.map { c ->
@@ -2012,6 +2244,7 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
                     }
                 }
                 s.copy(
+                    playheadMs = exactMs.coerceIn(0L, s.totalDurationMs),
                     blurredBgFill = blurredBg ?: s.blurredBgFill,
                     clips = nextClips
                 )
@@ -2024,13 +2257,17 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
                 )
             }
         }
-        scheduleVideoPreviewRender()
+        val latest = _videoState.value
+        val activeAtPlayhead = findClipAtTimelineMs(latest.clips, _livePlayheadMs.value)
+        if (blurredBg != null || !VideoMediaEngine.canUseGpuPreviewTransform(latest, activeAtPlayhead)) {
+            scheduleVideoPreviewRender()
+        }
         scheduleAutoSave(WorkspaceType.VIDEO)
     }
 
     /**
      * Delta-based canvas transform for Video Frame (pinch/drag/corner-scale/rotate).
-     * Automatically creates or updates a Keyframe (`◆`) at the current playhead whenever
+     * Automatically creates or updates a Keyframe (`◆`) at the exact current playhead whenever
      * the active Video clip already has at least one Keyframe!
      */
     fun adjustVideoCanvasTransform(
@@ -2042,12 +2279,13 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
     ) {
         recordVideoUndoSnapshot(coalesceTag = "canvas_transform")
         _videoState.update { s ->
-            val hit = findClipAtPlayhead(s)
+            val exactMs = currentExactPlayheadMs(s)
+            val hit = findClipAtPlayhead(s, exactMs)
             val activeClip = hit?.second ?: s.selectedClip
             if (activeClip != null && activeClip.keyframes.isNotEmpty()) {
                 val localMs = hit?.third ?: getSelectedClipLocalTimeMs()
                 val cur = VideoMediaEngine.interpolateKeyframes(activeClip.keyframes, localMs)
-                val nextZoom = (cur.scale * zoomFactor + zoomDelta).coerceIn(0.25f, 3.0f)
+                val nextZoom = (cur.scale * zoomFactor + zoomDelta).coerceIn(0.25f, 4.0f)
                 val nextX = (cur.xNorm + panDeltaX).coerceIn(-1f, 1f)
                 val nextY = (cur.yNorm + panDeltaY).coerceIn(-1f, 1f)
                 val nextRot = normalizeKeyframeAngle(cur.rotationDeg + rotationDeltaDeg)
@@ -2066,7 +2304,11 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
                         )
                     }
                 }
-                s.copy(clips = nextClips)
+                s.copy(
+                    playheadMs = exactMs.coerceIn(0L, s.totalDurationMs),
+                    clips = nextClips,
+                    selectedClipId = activeClip.id
+                )
             } else {
                 val selId = activeClip?.id
                 val nextClips = if (rotationDeltaDeg != 0f && selId != null) {
@@ -2078,14 +2320,18 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
                     s.clips
                 }
                 s.copy(
-                    cropZoom = (s.cropZoom * zoomFactor + zoomDelta).coerceIn(0.25f, 3.0f),
+                    cropZoom = (s.cropZoom * zoomFactor + zoomDelta).coerceIn(0.25f, 4.0f),
                     panX = (s.panX + panDeltaX).coerceIn(-1f, 1f),
                     panY = (s.panY + panDeltaY).coerceIn(-1f, 1f),
                     clips = nextClips
                 )
             }
         }
-        scheduleVideoPreviewRender()
+        val latest = _videoState.value
+        val activeAtPlayhead = findClipAtTimelineMs(latest.clips, _livePlayheadMs.value)
+        if (!VideoMediaEngine.canUseGpuPreviewTransform(latest, activeAtPlayhead)) {
+            scheduleVideoPreviewRender(immediate = false)
+        }
         scheduleAutoSave(WorkspaceType.VIDEO)
     }
 
@@ -2097,12 +2343,13 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
     ) {
         recordVideoUndoSnapshot(coalesceTag = "canvas_transform")
         _videoState.update { s ->
-            val hit = findClipAtPlayhead(s)
+            val exactMs = currentExactPlayheadMs(s)
+            val hit = findClipAtPlayhead(s, exactMs)
             val activeClip = hit?.second ?: s.selectedClip
             if (activeClip != null && activeClip.keyframes.isNotEmpty()) {
                 val localMs = hit?.third ?: getSelectedClipLocalTimeMs()
                 val cur = VideoMediaEngine.interpolateKeyframes(activeClip.keyframes, localMs)
-                val nextZoom = (zoom ?: cur.scale).coerceIn(0.25f, 3.0f)
+                val nextZoom = (zoom ?: cur.scale).coerceIn(0.25f, 4.0f)
                 val nextX = (panX ?: cur.xNorm).coerceIn(-1f, 1f)
                 val nextY = (panY ?: cur.yNorm).coerceIn(-1f, 1f)
                 val nextRot = rotationDeg ?: cur.rotationDeg
@@ -2121,7 +2368,11 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
                         )
                     }
                 }
-                s.copy(clips = nextClips)
+                s.copy(
+                    playheadMs = exactMs.coerceIn(0L, s.totalDurationMs),
+                    clips = nextClips,
+                    selectedClipId = activeClip.id
+                )
             } else {
                 val selId = activeClip?.id
                 val nextClips = if (rotationDeg != null && selId != null) {
@@ -2130,14 +2381,18 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
                     s.clips
                 }
                 s.copy(
-                    cropZoom = (zoom ?: s.cropZoom).coerceIn(0.25f, 3.0f),
+                    cropZoom = (zoom ?: s.cropZoom).coerceIn(0.25f, 4.0f),
                     panX = (panX ?: s.panX).coerceIn(-1f, 1f),
                     panY = (panY ?: s.panY).coerceIn(-1f, 1f),
                     clips = nextClips
                 )
             }
         }
-        scheduleVideoPreviewRender()
+        val latest = _videoState.value
+        val activeAtPlayhead = findClipAtTimelineMs(latest.clips, _livePlayheadMs.value)
+        if (!VideoMediaEngine.canUseGpuPreviewTransform(latest, activeAtPlayhead)) {
+            scheduleVideoPreviewRender()
+        }
         scheduleAutoSave(WorkspaceType.VIDEO)
     }
 
@@ -2235,8 +2490,10 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
     fun updateSelectedVideoText(transform: (VideoTextOverlay) -> VideoTextOverlay) {
         recordVideoUndoSnapshot(coalesceTag = "text_edit")
         _videoState.update { s ->
+            val exactMs = currentExactPlayheadMs(s)
             val id = s.selectedTextId ?: s.textLayers.firstOrNull()?.id ?: return@update s
             s.copy(
+                playheadMs = exactMs.coerceIn(0L, maxOf(s.totalDurationMs, s.textLayers.maxOfOrNull { it.endMs } ?: 0L)),
                 selectedTextId = id,
                 textLayers = s.textLayers.map { layer ->
                     if (layer.id != id) return@map layer
@@ -2244,8 +2501,8 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
                         transform(layer)
                     } else {
                         // Resolve active interpolated transform so canvas drag/scale/rotate/opacity
-                        // smoothly starts from the playhead pose and auto-upserts a Keyframe!
-                        val effective = VideoOverlayRenderer.resolveOverlayTransformAt(layer, s.playheadMs)
+                        // smoothly starts from the exact live playhead pose and auto-upserts a Keyframe!
+                        val effective = VideoOverlayRenderer.resolveOverlayTransformAt(layer, exactMs)
                         val updated = transform(effective)
                         val transformChanged =
                             kotlin.math.abs(updated.xNorm - effective.xNorm) > 0.0001f ||
@@ -2255,7 +2512,7 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
                                 kotlin.math.abs(updated.opacity - effective.opacity) > 0.0001f
                         if (transformChanged) {
                             val dur = (updated.endMs - updated.startMs).coerceAtLeast(1L)
-                            val localMs = (s.playheadMs - updated.startMs).coerceIn(0L, dur)
+                            val localMs = (exactMs - updated.startMs).coerceIn(0L, dur)
                             updated.copy(
                                 keyframes = upsertKeyframeInList(
                                     existing = updated.keyframes,
@@ -2281,7 +2538,11 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
                 }
             )
         }
-        scheduleVideoPreviewRender()
+        val latest = _videoState.value
+        val activeAtPlayhead = findClipAtTimelineMs(latest.clips, _livePlayheadMs.value)
+        if (!VideoMediaEngine.canUseGpuPreviewTransform(latest, activeAtPlayhead)) {
+            scheduleVideoPreviewRender()
+        }
         scheduleAutoSave(WorkspaceType.VIDEO)
     }
 
@@ -3717,6 +3978,6 @@ class XonixStudioViewModel(application: Application) : AndroidViewModel(applicat
         stopVideoVoiceoverRecording()
         runCatching { _videoPreviewBitmap.value?.recycle() }
         runCatching { _photoPreviewBitmap.value?.recycle() }
-        _clipThumbnails.value.values.flatten().forEach { bmp -> runCatching { bmp.recycle() } }
+        TimelineThumbnailCache.clear()
     }
 }

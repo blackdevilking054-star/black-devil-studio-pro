@@ -135,13 +135,25 @@ object VideoMediaEngine {
     }
 
     /**
-     * Extracts low-RAM 72x44 filmstrip thumbnails for a clip (safe for 2GB/3GB RAM devices).
+     * Asynchronously decodes and caches low-RAM (<= 120x120px RGB_565) filmstrip thumbnails
+     * on [kotlinx.coroutines.Dispatchers.IO] via [TimelineThumbnailCache].
+     */
+    suspend fun extractFilmstripThumbnailsAsync(
+        context: Context,
+        clip: VideoClip,
+        count: Int = 5
+    ): List<Bitmap> = TimelineThumbnailCache.loadFilmstripAsync(context, clip, count)
+
+    /**
+     * Synchronous fallback for low-RAM (<= 120x120px RGB_565) filmstrip thumbnails.
+     * Prefer [extractFilmstripThumbnailsAsync] for non-blocking IO caching.
      */
     fun extractFilmstripThumbnails(
         context: Context,
         clip: VideoClip,
         count: Int = 5
     ): List<Bitmap> {
+        TimelineThumbnailCache.getCachedFilmstrip(clip, count)?.let { return it }
         val safeCount = count.coerceIn(2, 6)
         val span = (clip.trimEndMs - clip.trimStartMs).coerceAtLeast(300L)
         val thumbs = ArrayList<Bitmap>(safeCount)
@@ -152,11 +164,23 @@ object VideoMediaEngine {
                 retriever.setDataSource(context, Uri.parse(clip.uriString))
                 for (i in 0 until safeCount) {
                     val ms = clip.trimStartMs + (span * i) / max(1, safeCount - 1)
-                    val frame = retriever.getFrameAtTime(ms * 1000L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                    val frame = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+                        retriever.getScaledFrameAtTime(
+                            ms * 1000L,
+                            MediaMetadataRetriever.OPTION_CLOSEST_SYNC,
+                            TimelineThumbnailCache.MAX_THUMB_EDGE_PX,
+                            TimelineThumbnailCache.MAX_THUMB_EDGE_PX
+                        )
+                    } else {
+                        retriever.getFrameAtTime(ms * 1000L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                    }
                     if (frame != null) {
-                        val small = Bitmap.createScaledBitmap(frame, 76, 46, true)
-                        if (small != frame) frame.recycle()
-                        thumbs.add(small)
+                        val compact = TimelineThumbnailCache.toCompactRgb565(
+                            frame,
+                            TimelineThumbnailCache.MAX_THUMB_EDGE_PX
+                        )
+                        if (compact !== frame) frame.recycle()
+                        thumbs.add(compact)
                     }
                 }
             } catch (_: Exception) {
@@ -171,11 +195,15 @@ object VideoMediaEngine {
                 context = context,
                 uriString = null,
                 fallbackDrawable = clip.fallbackDrawable ?: R.drawable.img_studio_sample_bg_1795185351810,
-                maxDimension = 128
+                maxDimension = TimelineThumbnailCache.MAX_THUMB_EDGE_PX
             )
             if (fallback != null) {
-                val small = Bitmap.createScaledBitmap(fallback, 76, 46, true)
-                repeat(safeCount) { thumbs.add(small) }
+                val compact = TimelineThumbnailCache.toCompactRgb565(
+                    fallback,
+                    TimelineThumbnailCache.MAX_THUMB_EDGE_PX
+                )
+                if (compact !== fallback) fallback.recycle()
+                repeat(safeCount) { thumbs.add(compact) }
             }
         }
         return thumbs
@@ -245,11 +273,19 @@ object VideoMediaEngine {
      */
     fun interpolateKeyframes(keyframes: List<VideoKeyframe>, localClipMs: Long): InterpolatedKeyframe {
         if (keyframes.isEmpty()) return InterpolatedKeyframe()
-        val sorted = keyframes.sortedBy { it.timeMs }
+        // Zero-allocation fast path when keyframes are already sorted (called at 60fps inside graphicsLayer)
+        var alreadySorted = true
+        for (i in 1 until keyframes.size) {
+            if (keyframes[i].timeMs < keyframes[i - 1].timeMs) {
+                alreadySorted = false
+                break
+            }
+        }
+        val sorted = if (alreadySorted) keyframes else keyframes.sortedBy { it.timeMs }
         fun sanitized(x: Float, y: Float, s: Float, r: Float, o: Float): InterpolatedKeyframe {
             val safeX = if (x.isFinite()) x.coerceIn(-1f, 1f) else 0f
             val safeY = if (y.isFinite()) y.coerceIn(-1f, 1f) else 0f
-            val safeS = if (s.isFinite()) s.coerceIn(0.2f, 3.0f) else 1f
+            val safeS = if (s.isFinite()) s.coerceIn(0.2f, 4.0f) else 1f
             val safeR = if (r.isFinite()) r else 0f
             val safeO = if (o.isFinite()) o.coerceIn(0f, 1f) else 1f
             return InterpolatedKeyframe(safeX, safeY, safeS, safeR, safeO)
@@ -315,6 +351,14 @@ object VideoMediaEngine {
         }
     }
 
+    fun trimMemory() {
+        cachedFrame = null
+        synchronized(retrieverLock) {
+            retrieverCache.values.forEach { r -> runCatching { r.release() } }
+            retrieverCache.clear()
+        }
+    }
+
     fun extractClipFrame(
         context: Context,
         clip: VideoClip,
@@ -341,11 +385,22 @@ object VideoMediaEngine {
             val retriever = getOrOpenRetriever(context, clip.uriString)
             if (retriever != null) {
                 try {
+                    // Use hardware-scaled getScaledFrameAtTime on API 27+ so 4K clips never allocate
+                    // 33 MB raw ARGB_8888 frames in Java heap on 2GB/3GB RAM phones.
                     val frame = synchronized(retrieverLock) {
-                        retriever.getFrameAtTime(
-                            bucketMs * 1000L,
-                            MediaMetadataRetriever.OPTION_CLOSEST_SYNC
-                        )
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+                            retriever.getScaledFrameAtTime(
+                                bucketMs * 1000L,
+                                MediaMetadataRetriever.OPTION_CLOSEST_SYNC,
+                                maxEdge,
+                                maxEdge
+                            )
+                        } else {
+                            retriever.getFrameAtTime(
+                                bucketMs * 1000L,
+                                MediaMetadataRetriever.OPTION_CLOSEST_SYNC
+                            )
+                        }
                     }
                     if (frame != null) {
                         val scaled = scaleDownIfNeeded(frame, maxEdge)
@@ -367,7 +422,8 @@ object VideoMediaEngine {
             context = context,
             uriString = null,
             fallbackDrawable = clip.fallbackDrawable ?: R.drawable.img_studio_sample_bg_1795185351810,
-            maxDimension = maxEdge
+            maxDimension = maxEdge,
+            isExport = maxEdge > ImageProcessingEngine.MAX_PREVIEW_DIMENSION_PX
         )
         val result = fallback ?: Bitmap.createBitmap(320, 180, Bitmap.Config.ARGB_8888).apply {
             eraseColor(Color.rgb(12, 8, 16))
@@ -564,10 +620,26 @@ object VideoMediaEngine {
         )
     }
 
+    /**
+     * Returns true when live preview transforms (Keyframes, scale, pan, rotation, opacity, flip)
+     * and Text/Sticker overlays can be composited at 60fps directly on the GPU via Compose
+     * `graphicsLayer` + draw-phase `Canvas`, avoiding slow per-frame CPU transform baking.
+     */
+    fun canUseGpuPreviewTransform(state: VideoEditorState, activeClip: VideoClip?): Boolean {
+        if (activeClip == null) return false
+        if (state.pip.enabled && !state.pip.uriString.isNullOrBlank()) return false
+        if (state.bgFillMode == com.example.model.VideoBgFillMode.IMAGE && !state.bgImageUri.isNullOrBlank()) {
+            return false
+        }
+        return true
+    }
+
     fun renderPreviewAtPlayhead(
         context: Context,
         state: VideoEditorState,
-        maxEdge: Int
+        maxEdge: Int,
+        bakeVideoTransform: Boolean = true,
+        bakeOverlays: Boolean = true
     ): Bitmap {
         val ratio = state.aspectPreset.ratioW.toFloat() / state.aspectPreset.ratioH.toFloat()
         val targetW: Int
@@ -719,11 +791,11 @@ object VideoMediaEngine {
         }
 
         val hasVideoKeyframes = activeClip.keyframes.isNotEmpty()
-        val effCropZoom = if (hasVideoKeyframes) kf.scale else state.cropZoom
-        val effPanX = if (hasVideoKeyframes) kf.xNorm else state.panX
-        val effPanY = if (hasVideoKeyframes) kf.yNorm else state.panY
-        val effClipRot = if (hasVideoKeyframes) kf.rotationDeg else activeClip.rotationDeg
-        val effOpacity = if (hasVideoKeyframes) kf.opacity else 1f
+        val effCropZoom = if (!bakeVideoTransform) 1f else if (hasVideoKeyframes) kf.scale else state.cropZoom
+        val effPanX = if (!bakeVideoTransform) 0f else if (hasVideoKeyframes) kf.xNorm else state.panX
+        val effPanY = if (!bakeVideoTransform) 0f else if (hasVideoKeyframes) kf.yNorm else state.panY
+        val effClipRot = if (!bakeVideoTransform) 0f else if (hasVideoKeyframes) kf.rotationDeg else activeClip.rotationDeg
+        val effOpacity = if (!bakeVideoTransform) 1f else if (hasVideoKeyframes) kf.opacity else 1f
 
         val rendered = ImageProcessingEngine.renderVideoFrame(
             context = context,
@@ -733,15 +805,15 @@ object VideoMediaEngine {
             cropZoom = effCropZoom,
             panX = effPanX,
             panY = effPanY,
-            blurredBgFill = state.blurredBgFill,
-            bgFillMode = state.bgFillMode,
-            bgFillColorArgb = state.bgFillColorArgb,
-            bgImageUri = state.bgImageUri,
+            blurredBgFill = if (bakeVideoTransform) state.blurredBgFill else false,
+            bgFillMode = if (bakeVideoTransform) state.bgFillMode else com.example.model.VideoBgFillMode.COLOR,
+            bgFillColorArgb = if (bakeVideoTransform) state.bgFillColorArgb else Color.BLACK,
+            bgImageUri = if (bakeVideoTransform) state.bgImageUri else null,
             clipRotationDeg = effClipRot,
-            clipFlipH = activeClip.flipH,
-            clipFlipV = activeClip.flipV,
+            clipFlipH = if (bakeVideoTransform) activeClip.flipH else false,
+            clipFlipV = if (bakeVideoTransform) activeClip.flipV else false,
             clipMirrorMode = activeClip.mirrorMode,
-            stabilizeEnabled = activeClip.stabilizeEnabled,
+            stabilizeEnabled = if (bakeVideoTransform) activeClip.stabilizeEnabled else false,
             motionBlur = activeClip.motionBlur,
             keyframeX = 0f,
             keyframeY = 0f,
@@ -769,7 +841,7 @@ object VideoMediaEngine {
             transitionSplitProgress = fx.splitProgress,
             flashOverlayAlpha = fx.flashAlpha,
             flashOverlayColor = fx.flashColor,
-            activeTexts = state.textLayers,
+            activeTexts = if (bakeOverlays) state.textLayers else emptyList(),
             playheadMs = state.playheadMs,
             previousFrame = prevClipBackdrop
         )

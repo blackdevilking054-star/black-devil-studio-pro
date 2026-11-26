@@ -23,7 +23,10 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Redo
+import androidx.compose.material.icons.automirrored.filled.Undo
 import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Save
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.AlertDialog
@@ -73,6 +76,11 @@ fun StudioTopBar(
     autoSaveLabel: String,
     exportProgress: Float?,
     userInitial: String,
+    canUndo: Boolean = false,
+    canRedo: Boolean = false,
+    onNavigateHome: () -> Unit = {},
+    onUndo: () -> Unit = {},
+    onRedo: () -> Unit = {},
     onQuickSave: () -> Unit,
     onShareApp: () -> Unit,
     onOpenProfile: () -> Unit,
@@ -84,132 +92,219 @@ fun StudioTopBar(
         modifier = Modifier.fillMaxWidth()
     ) {
         Column(modifier = Modifier.statusBarsPadding()) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 14.dp, vertical = 8.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
+            if (workspace == StudioWorkspace.VIDEO) {
+                // Minimal single-row Video Editor top bar: Home (left) | Undo & Redo | Crimson Export (right)
                 Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(48.dp)
+                        .padding(horizontal = 8.dp),
                     verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier.weight(1f)
+                    horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    Image(
-                        painter = painterResource(id = R.drawable.ic_bd_logo_fg),
-                        contentDescription = "Black Devil Studio Pro Logo",
-                        contentScale = ContentScale.Crop,
+                    IconButton(
+                        onClick = onNavigateHome,
                         modifier = Modifier
-                            .size(34.dp)
-                            .clip(RoundedCornerShape(10.dp))
-                            .border(1.dp, ElectricCyan.copy(alpha = 0.65f), RoundedCornerShape(10.dp))
-                    )
-                    Spacer(Modifier.width(10.dp))
-                    Column {
-                        Text(
-                            text = "Black Devil Studio Pro",
-                            style = MaterialTheme.typography.titleMedium.copy(
-                                fontWeight = FontWeight.ExtraBold,
-                                letterSpacing = (-0.2).sp
-                            ),
-                            color = TextPrimary,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
+                            .size(48.dp)
+                            .testTag("video_top_home_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Home,
+                            contentDescription = "Home",
+                            tint = TextPrimary,
+                            modifier = Modifier.size(22.dp)
                         )
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Box(
-                                modifier = Modifier
-                                    .size(6.dp)
-                                    .clip(CircleShape)
-                                    .background(EmeraldSafe)
-                            )
-                            Spacer(Modifier.width(5.dp))
-                            Text(
-                                text = if (workspace == StudioWorkspace.HOME) workspace.badge else autoSaveLabel,
-                                style = MaterialTheme.typography.labelSmall,
-                                color = TextSecondary,
-                                maxLines = 1
-                            )
-                        }
                     }
-                }
 
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    if (workspace == StudioWorkspace.HOME) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
                         IconButton(
-                            onClick = onShareApp,
+                            onClick = onUndo,
+                            enabled = canUndo,
                             modifier = Modifier
-                                .size(42.dp)
-                                .testTag("top_share_app_button")
+                                .size(48.dp)
+                                .testTag("video_undo_button")
                         ) {
                             Icon(
-                                imageVector = Icons.Default.Share,
-                                contentDescription = "Refer and Share App",
-                                tint = ElectricCyan,
-                                modifier = Modifier.size(21.dp)
-                            )
-                        }
-                    } else {
-                        IconButton(
-                            onClick = onQuickSave,
-                            modifier = Modifier
-                                .size(40.dp)
-                                .testTag("top_save_button")
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.Save,
-                                contentDescription = "Save Project",
-                                tint = TextSecondary,
+                                imageVector = Icons.AutoMirrored.Filled.Undo,
+                                contentDescription = "Undo",
+                                tint = if (canUndo) Color.White else TextSecondary.copy(alpha = 0.35f),
                                 modifier = Modifier.size(20.dp)
                             )
                         }
-                        Button(
-                            onClick = onExport,
-                            enabled = exportProgress == null,
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = ElectricCyan,
-                                contentColor = Color.White,
-                                disabledContainerColor = ElectricCyanContainer,
-                                disabledContentColor = ElectricCyan
-                            ),
-                            shape = RoundedCornerShape(20.dp),
-                            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp),
+                        IconButton(
+                            onClick = onRedo,
+                            enabled = canRedo,
                             modifier = Modifier
-                                .height(36.dp)
-                                .testTag("top_export_button")
+                                .size(48.dp)
+                                .testTag("video_redo_button")
                         ) {
                             Icon(
-                                imageVector = Icons.Default.Download,
-                                contentDescription = null,
-                                modifier = Modifier.size(15.dp)
-                            )
-                            Spacer(Modifier.width(4.dp))
-                            Text(
-                                text = if (exportProgress != null) "${(exportProgress * 100).roundToInt()}%" else "Export",
-                                style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold)
+                                imageVector = Icons.AutoMirrored.Filled.Redo,
+                                contentDescription = "Redo",
+                                tint = if (canRedo) Color.White else TextSecondary.copy(alpha = 0.35f),
+                                modifier = Modifier.size(20.dp)
                             )
                         }
                     }
 
-                    // Top-right Profile Avatar
-                    Surface(
-                        onClick = onOpenProfile,
-                        shape = CircleShape,
-                        color = ElectricCyanContainer,
-                        border = BorderStroke(1.2.dp, ElectricCyan),
+                    Button(
+                        onClick = onExport,
+                        enabled = exportProgress == null,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = ElectricCyan,
+                            contentColor = Color.White,
+                            disabledContainerColor = ElectricCyanContainer,
+                            disabledContentColor = ElectricCyan
+                        ),
+                        shape = RoundedCornerShape(20.dp),
+                        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 6.dp),
                         modifier = Modifier
-                            .size(38.dp)
-                            .testTag("top_profile_avatar_button")
+                            .height(36.dp)
+                            .testTag("top_export_button")
                     ) {
-                        Box(contentAlignment = Alignment.Center) {
+                        Icon(
+                            imageVector = Icons.Default.Download,
+                            contentDescription = null,
+                            modifier = Modifier.size(15.dp)
+                        )
+                        Spacer(Modifier.width(5.dp))
+                        Text(
+                            text = if (exportProgress != null) "${(exportProgress * 100).roundToInt()}%" else "Export",
+                            style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold)
+                        )
+                    }
+                }
+            } else {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 14.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Image(
+                            painter = painterResource(id = R.drawable.ic_bd_logo_fg),
+                            contentDescription = "Black Devil Studio Pro Logo",
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier
+                                .size(34.dp)
+                                .clip(RoundedCornerShape(10.dp))
+                                .border(1.dp, ElectricCyan.copy(alpha = 0.65f), RoundedCornerShape(10.dp))
+                        )
+                        Spacer(Modifier.width(10.dp))
+                        Column {
                             Text(
-                                text = userInitial.take(1).uppercase(),
-                                style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.ExtraBold),
-                                color = ElectricCyan
+                                text = if (workspace == StudioWorkspace.HOME) "Black Devil Studio Pro" else workspace.label,
+                                style = MaterialTheme.typography.titleMedium.copy(
+                                    fontWeight = FontWeight.ExtraBold,
+                                    letterSpacing = (-0.2).sp
+                                ),
+                                color = TextPrimary,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
                             )
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(6.dp)
+                                        .clip(CircleShape)
+                                        .background(EmeraldSafe)
+                                )
+                                Spacer(Modifier.width(5.dp))
+                                Text(
+                                    text = if (workspace == StudioWorkspace.HOME) workspace.badge else autoSaveLabel,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = TextSecondary,
+                                    maxLines = 1
+                                )
+                            }
+                        }
+                    }
+
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        if (workspace == StudioWorkspace.HOME) {
+                            IconButton(
+                                onClick = onShareApp,
+                                modifier = Modifier
+                                    .size(42.dp)
+                                    .testTag("top_share_app_button")
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Share,
+                                    contentDescription = "Refer and Share App",
+                                    tint = ElectricCyan,
+                                    modifier = Modifier.size(21.dp)
+                                )
+                            }
+                        } else {
+                            IconButton(
+                                onClick = onQuickSave,
+                                modifier = Modifier
+                                    .size(40.dp)
+                                    .testTag("top_save_button")
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Save,
+                                    contentDescription = "Save Project",
+                                    tint = TextSecondary,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                            }
+                            Button(
+                                onClick = onExport,
+                                enabled = exportProgress == null,
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = ElectricCyan,
+                                    contentColor = Color.White,
+                                    disabledContainerColor = ElectricCyanContainer,
+                                    disabledContentColor = ElectricCyan
+                                ),
+                                shape = RoundedCornerShape(20.dp),
+                                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp),
+                                modifier = Modifier
+                                    .height(36.dp)
+                                    .testTag("top_export_button")
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Download,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(15.dp)
+                                )
+                                Spacer(Modifier.width(4.dp))
+                                Text(
+                                    text = if (exportProgress != null) "${(exportProgress * 100).roundToInt()}%" else "Export",
+                                    style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold)
+                                )
+                            }
+                        }
+
+                        // Top-right Profile Avatar
+                        Surface(
+                            onClick = onOpenProfile,
+                            shape = CircleShape,
+                            color = ElectricCyanContainer,
+                            border = BorderStroke(1.2.dp, ElectricCyan),
+                            modifier = Modifier
+                                .size(38.dp)
+                                .testTag("top_profile_avatar_button")
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                Text(
+                                    text = userInitial.take(1).uppercase(),
+                                    style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.ExtraBold),
+                                    color = ElectricCyan
+                                )
+                            }
                         }
                     }
                 }

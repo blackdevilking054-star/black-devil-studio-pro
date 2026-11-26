@@ -6,6 +6,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.speech.RecognizerIntent
+import android.view.TextureView
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
@@ -26,6 +27,7 @@ import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
@@ -52,6 +54,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
 import androidx.compose.material.icons.automirrored.filled.Redo
 import androidx.compose.material.icons.automirrored.filled.RotateRight
 import androidx.compose.material.icons.automirrored.filled.Undo
@@ -65,6 +68,7 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ClosedCaption
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.ContentCut
+import androidx.compose.material.icons.filled.Crop
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Diamond
 import androidx.compose.material.icons.filled.Download
@@ -78,6 +82,7 @@ import androidx.compose.material.icons.filled.Layers
 import androidx.compose.material.icons.filled.Loop
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MusicNote
+import androidx.compose.material.icons.filled.Opacity
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.Photo
 import androidx.compose.material.icons.filled.PictureInPictureAlt
@@ -105,9 +110,11 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
@@ -119,8 +126,11 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -131,12 +141,15 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.zIndex
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.example.engine.ExoVideoPlaybackController
 import com.example.engine.ImageProcessingEngine
 import com.example.engine.VideoMediaEngine
 import com.example.engine.VideoOverlayRenderer
+import kotlinx.coroutines.delay
 import com.example.model.BlendModeKind
 import com.example.model.FilterCategory
 import com.example.model.HardwareEncoderCapabilities
@@ -186,7 +199,7 @@ import kotlin.math.roundToInt
 import kotlin.math.sin
 
 private enum class VideoToolTab {
-    NONE, TRIM, SPLIT, AUDIO, TEXT, STICKER, FILTER, TRANSITIONS, SPEED, KEYFRAME, DELETE, ADJUST, ENHANCE, FRAME, OVERLAY, EXPORT
+    NONE, TRIM, SPLIT, AUDIO, TEXT, STICKER, FILTER, TRANSITIONS, SPEED, KEYFRAME, DELETE, ADJUST, ENHANCE, FRAME, OVERLAY, OPACITY, EXPORT
 }
 
 private enum class VideoTrimControl(val label: String) {
@@ -287,6 +300,22 @@ fun VideoEditorWorkspace(
     var showStickerRow by rememberSaveable { mutableStateOf(false) }
     var isStickerCropping by rememberSaveable { mutableStateOf(false) }
 
+    // User-draggable Preview / Timeline vertical split weight (defaults to 67% screen height for maximum preview!)
+    var previewWeight by rememberSaveable { mutableFloatStateOf(0.67f) }
+    var preDrawerPreviewWeight by rememberSaveable { mutableFloatStateOf(0.67f) }
+    var isDraggingSplitDivider by remember { mutableStateOf(false) }
+
+    LaunchedEffect(isToolDrawerExpanded) {
+        if (isToolDrawerExpanded) {
+            if (previewWeight > 0.50f) {
+                preDrawerPreviewWeight = previewWeight
+                previewWeight = 0.44f
+            }
+        } else {
+            previewWeight = preDrawerPreviewWeight.coerceIn(0.32f, 0.74f)
+        }
+    }
+
     LaunchedEffect(openEnhanceRequested) {
         if (openEnhanceRequested) {
             activeTab = VideoToolTab.ENHANCE
@@ -381,13 +410,76 @@ fun VideoEditorWorkspace(
             ToolTabItem(VideoToolTab.DELETE, "Delete", Icons.Default.Delete),
             ToolTabItem(VideoToolTab.ADJUST, "Adjust", Icons.Default.Tune),
             ToolTabItem(VideoToolTab.ENHANCE, "AI Magic", Icons.Default.AutoAwesome),
-            ToolTabItem(VideoToolTab.FRAME, "Transform", Icons.Default.AspectRatio),
+            ToolTabItem(VideoToolTab.FRAME, "Aspect Ratio / Transform", Icons.Default.AspectRatio),
             ToolTabItem(VideoToolTab.OVERLAY, "Overlay", Icons.Default.PictureInPictureAlt),
+            ToolTabItem(VideoToolTab.OPACITY, "Opacity", Icons.Default.Opacity),
             ToolTabItem(VideoToolTab.EXPORT, "Export", Icons.Default.Download)
         )
     }
 
     val hasActiveUserPip = state.pip.enabled && !state.pip.uriString.isNullOrBlank()
+
+    // =========================================================================
+    // HARDWARE-ACCELERATED EXOPLAYER CONTROLLER + DECOUPLED 60FPS PLAYHEAD STATE
+    // =========================================================================
+    val exoController = remember(context) { ExoVideoPlaybackController(context) }
+    DisposableEffect(exoController) {
+        onDispose { exoController.release() }
+    }
+
+    // Decoupled 60fps playhead state: NEVER read directly in the root workspace composition.
+    // Consumed strictly inside graphicsLayer { ... }, draw-phase Canvas, and tiny leaf labels.
+    val livePlayheadMsState = remember { mutableLongStateOf(state.playheadMs) }
+    val isScrubbingAny = remember { mutableStateOf(false) }
+
+    LaunchedEffect(viewModel) {
+        viewModel.livePlayheadMs.collect { ms ->
+            if (!isScrubbingAny.value) {
+                livePlayheadMsState.longValue = ms
+            }
+        }
+    }
+
+    LaunchedEffect(state.playheadMs, state.isPlaying) {
+        if (!state.isPlaying && !isScrubbingAny.value) {
+            livePlayheadMsState.longValue = state.playheadMs
+        }
+    }
+
+    val currentState by rememberUpdatedState(state)
+    val activePlayheadTriple = remember(state.clips, state.playheadMs) {
+        resolveClipTimingAt(state.clips, state.playheadMs)
+    }
+    val activePlayheadClip = activePlayheadTriple?.first
+    val activeClipStartMs = activePlayheadTriple?.second ?: 0L
+    val activePlayheadLocalMs = activePlayheadTriple?.third ?: 0L
+    val useHardwareExo = remember(state.colorGrade, state.pip, activePlayheadClip) {
+        ExoVideoPlaybackController.canUseHardwareExoSurface(state, activePlayheadClip)
+    }
+
+    // Sync Media3 ExoPlayer clip & play/pause state (uses DefaultLoadControl + SEEK_CLOSEST_SYNC)
+    LaunchedEffect(
+        useHardwareExo,
+        activePlayheadClip?.id,
+        activePlayheadClip?.uriString,
+        state.isPlaying,
+        activePlayheadClip?.speed,
+        if (state.isPlaying) 0L else state.playheadMs
+    ) {
+        if (useHardwareExo && activePlayheadClip != null) {
+            exoController.ensureClipLoaded(activePlayheadClip.uriString)
+            val targetLocal = (livePlayheadMsState.longValue - activeClipStartMs)
+                .coerceIn(0L, activePlayheadClip.effectiveDurationMs)
+            val srcMs = mapLocalMsToSourceMs(activePlayheadClip, targetLocal)
+            exoController.syncPlaybackState(
+                playing = state.isPlaying,
+                speed = activePlayheadClip.speed,
+                desiredSourceMs = srcMs
+            )
+        } else {
+            exoController.pause()
+        }
+    }
 
     // =========================================================================
     // FULLSCREEN THEATER PREVIEW MODE (VN / InShot Instant Expand)
@@ -399,19 +491,98 @@ fun VideoEditorWorkspace(
                 .fillMaxSize()
                 .background(OledBlack)
         ) {
+            val useGpuTransformFullscreen = !useHardwareExo &&
+                VideoMediaEngine.canUseGpuPreviewTransform(state, activePlayheadClip)
             Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .padding(horizontal = 8.dp, vertical = 56.dp),
+                    .padding(horizontal = 8.dp, vertical = 56.dp)
+                    .clipToBounds(),
                 contentAlignment = Alignment.Center
             ) {
-                if (previewBitmap != null && !previewBitmap.isRecycled) {
+                if (useHardwareExo && activePlayheadClip != null) {
+                    AndroidView(
+                        factory = { ctx ->
+                            TextureView(ctx).apply {
+                                isOpaque = false
+                                exoController.attachTextureView(this)
+                            }
+                        },
+                        update = { tv -> exoController.attachTextureView(tv) },
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .graphicsLayer {
+                                val curMs = livePlayheadMsState.longValue
+                                val curS = currentState
+                                val localMs = (curMs - activeClipStartMs)
+                                    .coerceIn(0L, activePlayheadClip.effectiveDurationMs)
+                                val hasKfs = activePlayheadClip.keyframes.isNotEmpty()
+                                val interp = if (hasKfs) {
+                                    VideoMediaEngine.interpolateKeyframes(activePlayheadClip.keyframes, localMs)
+                                } else null
+                                val stab = if (activePlayheadClip.stabilizeEnabled) 1.09f else 1f
+                                val sc = ((interp?.scale ?: curS.cropZoom).coerceIn(0.25f, 4.0f)) * stab
+                                val flipX = if (activePlayheadClip.flipH) -1f else 1f
+                                val flipY = if (activePlayheadClip.flipV) -1f else 1f
+                                scaleX = sc * flipX
+                                scaleY = sc * flipY
+                                translationX = (interp?.xNorm ?: curS.panX) * size.width * 0.5f
+                                translationY = (interp?.yNorm ?: curS.panY) * size.height * 0.5f
+                                rotationZ = interp?.rotationDeg ?: activePlayheadClip.rotationDeg
+                                alpha = (interp?.opacity ?: 1f).coerceIn(0f, 1f)
+                            }
+                    )
+                } else if (previewBitmap != null && !previewBitmap.isRecycled) {
+                    val bmpModifier = if (useGpuTransformFullscreen && activePlayheadClip != null) {
+                        Modifier
+                            .fillMaxSize()
+                            .graphicsLayer {
+                                val curMs = livePlayheadMsState.longValue
+                                val curS = currentState
+                                val localMs = (curMs - activeClipStartMs)
+                                    .coerceIn(0L, activePlayheadClip.effectiveDurationMs)
+                                val hasKfs = activePlayheadClip.keyframes.isNotEmpty()
+                                val interp = if (hasKfs) {
+                                    VideoMediaEngine.interpolateKeyframes(activePlayheadClip.keyframes, localMs)
+                                } else null
+                                val stab = if (activePlayheadClip.stabilizeEnabled) 1.09f else 1f
+                                val sc = ((interp?.scale ?: curS.cropZoom).coerceIn(0.25f, 4.0f)) * stab
+                                val flipX = if (activePlayheadClip.flipH) -1f else 1f
+                                val flipY = if (activePlayheadClip.flipV) -1f else 1f
+                                scaleX = sc * flipX
+                                scaleY = sc * flipY
+                                translationX = (interp?.xNorm ?: curS.panX) * size.width * 0.5f
+                                translationY = (interp?.yNorm ?: curS.panY) * size.height * 0.5f
+                                rotationZ = interp?.rotationDeg ?: activePlayheadClip.rotationDeg
+                                alpha = (interp?.opacity ?: 1f).coerceIn(0f, 1f)
+                            }
+                    } else {
+                        Modifier.fillMaxSize()
+                    }
                     Image(
                         bitmap = previewBitmap.asImageBitmap(),
                         contentDescription = "Fullscreen Video Preview",
                         contentScale = ContentScale.Fit,
-                        modifier = Modifier.fillMaxSize()
+                        modifier = bmpModifier
                     )
+                }
+
+                if ((useHardwareExo || useGpuTransformFullscreen) && activePlayheadClip != null) {
+                    Canvas(modifier = Modifier.fillMaxSize()) {
+                        val curMs = livePlayheadMsState.longValue
+                        val w = size.width.roundToInt().coerceAtLeast(1)
+                        val h = size.height.roundToInt().coerceAtLeast(1)
+                        drawIntoCanvas { canvas ->
+                            VideoOverlayRenderer.drawOverlays(
+                                context = context,
+                                canvas = canvas.nativeCanvas,
+                                activeTexts = currentState.textLayers,
+                                playheadMs = curMs,
+                                targetW = w,
+                                targetH = h
+                            )
+                        }
+                    }
                 }
             }
 
@@ -454,83 +625,35 @@ fun VideoEditorWorkspace(
                     .align(Alignment.BottomCenter)
                     .fillMaxWidth()
             ) {
-                Column(
-                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
-                    verticalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    Slider(
-                        value = state.playheadMs.toFloat(),
-                        onValueChange = { viewModel.seekPlayhead(it.toLong()) },
-                        valueRange = 0f..state.totalDurationMs.toFloat().coerceAtLeast(1000f),
-                        colors = SliderDefaults.colors(
-                            thumbColor = ElectricCyan,
-                            activeTrackColor = ElectricCyan,
-                            inactiveTrackColor = StudioBorder
-                        ),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(22.dp)
-                    )
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(
-                            text = "${formatSimpleTime(state.playheadMs)} / ${formatSimpleTime(state.totalDurationMs)}",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = ElectricCyan
-                        )
-                        Surface(
-                            onClick = { viewModel.toggleVideoPlayback() },
-                            shape = CircleShape,
-                            color = ElectricCyan,
-                            modifier = Modifier.size(48.dp)
-                        ) {
-                            Box(contentAlignment = Alignment.Center) {
-                                Icon(
-                                    imageVector = if (state.isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
-                                    contentDescription = if (state.isPlaying) "Pause" else "Play",
-                                    tint = Color.White,
-                                    modifier = Modifier.size(28.dp)
-                                )
-                            }
+                LiveFullscreenPlaybackBar(
+                    playheadMsProvider = { livePlayheadMsState.longValue },
+                    totalDurationMs = state.totalDurationMs,
+                    isPlaying = state.isPlaying,
+                    loopPlayback = state.loopPlayback,
+                    onScrubTo = { targetMs ->
+                        isScrubbingAny.value = true
+                        livePlayheadMsState.longValue = targetMs
+                        val hit = resolveClipTimingAt(currentState.clips, targetMs)
+                        val canExo = ExoVideoPlaybackController.canUseHardwareExoSurface(currentState, hit?.first)
+                        if (canExo && hit != null) {
+                            exoController.ensureClipLoaded(hit.first.uriString)
+                            exoController.seekScrub(mapLocalMsToSourceMs(hit.first, hit.third))
                         }
-                        IconButton(
-                            onClick = { viewModel.toggleLoopPlayback() },
-                            modifier = Modifier.size(44.dp)
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.Loop,
-                                contentDescription = "Loop Video",
-                                tint = if (state.loopPlayback) ElectricCyan else TextSecondary
-                            )
-                        }
-                    }
-                }
+                        viewModel.updateLivePlayheadScrub(targetMs, renderSoftwarePreview = !canExo)
+                    },
+                    onScrubFinished = {
+                        isScrubbingAny.value = false
+                        viewModel.commitPlayheadPosition(livePlayheadMsState.longValue)
+                    },
+                    onTogglePlay = { viewModel.toggleVideoPlayback() },
+                    onToggleLoop = { viewModel.toggleLoopPlayback() }
+                )
             }
         }
         return
     }
 
-    val currentState by rememberUpdatedState(state)
     val currentCanvasSelection by rememberUpdatedState(canvasSelection)
-    val activePlayheadInfo = remember(state.clips, state.playheadMs) {
-        var acc = 0L
-        var found: Pair<com.example.model.VideoClip, Long>? = null
-        for (i in state.clips.indices) {
-            val clip = state.clips[i]
-            val dur = clip.effectiveDurationMs
-            if (state.playheadMs <= acc + dur || i == state.clips.lastIndex) {
-                found = clip to (state.playheadMs - acc).coerceIn(0L, dur)
-                break
-            }
-            acc += dur
-        }
-        found
-    }
-    val activePlayheadClip = activePlayheadInfo?.first
-    val activePlayheadLocalMs = activePlayheadInfo?.second ?: 0L
     val activeKeyframeInterp = remember(activePlayheadClip?.keyframes, activePlayheadLocalMs) {
         val kfs = activePlayheadClip?.keyframes.orEmpty()
         VideoMediaEngine.interpolateKeyframes(kfs, activePlayheadLocalMs)
@@ -581,34 +704,42 @@ fun VideoEditorWorkspace(
         }
     }
 
-    Column(
+    BoxWithConstraints(
         modifier = modifier
             .fillMaxSize()
             .background(OledBlack)
     ) {
-        // =========================================================================
-        // 1. UPPER INTERACTIVE VIDEO PREVIEW CANVAS + PLAYBAR (Expands smoothly to fill middle gap when drawer is closed)
-        // =========================================================================
+        val workspaceHeightPx = with(density) { maxHeight.toPx() }.coerceAtLeast(360f)
+        val clampedPreviewWeight = previewWeight.coerceIn(0.30f, 0.75f)
+
         Column(
             modifier = Modifier
-                .fillMaxWidth()
-                .weight(if (isToolDrawerExpanded) 0.45f else 0.62f)
+                .fillMaxSize()
                 .background(OledBlack)
         ) {
-            BoxWithConstraints(
+            // =========================================================================
+            // 1. UPPER INTERACTIVE VIDEO PREVIEW CANVAS + PLAYBAR (65-70% default, smoothly draggable via split pill)
+            // =========================================================================
+            Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .weight(1f)
-                    .clickable(
-                        interactionSource = remember { MutableInteractionSource() },
-                        indication = null
-                    ) {
-                        canvasSelection = CanvasSelectionTarget.NONE
-                        isToolDrawerExpanded = false
-                    }
-                    .padding(start = 24.dp, end = 24.dp, top = 36.dp, bottom = 14.dp),
-                contentAlignment = Alignment.Center
+                    .weight(clampedPreviewWeight)
+                    .background(OledBlack)
             ) {
+                BoxWithConstraints(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f)
+                        .clickable(
+                            interactionSource = remember { MutableInteractionSource() },
+                            indication = null
+                        ) {
+                            canvasSelection = CanvasSelectionTarget.NONE
+                            isToolDrawerExpanded = false
+                        }
+                        .padding(horizontal = 10.dp, vertical = 6.dp),
+                    contentAlignment = Alignment.Center
+                ) {
                 val targetRatio = state.aspectPreset.ratioW.toFloat() / state.aspectPreset.ratioH.toFloat()
                 val availW = maxWidth
                 val availH = maxHeight
@@ -698,15 +829,20 @@ fun VideoEditorWorkspace(
                                         }
                                     }
 
-                                    // 3. Fallback to Video Frame selection
+                                    // 3. Fallback to Video Frame selection (toggles 8-handle resize box + clip toolbar)
                                     if (curState.clips.isEmpty()) {
                                         canvasSelection = CanvasSelectionTarget.NONE
                                         return@detectTapGestures
                                     }
-                                    canvasSelection = if (currentCanvasSelection == CanvasSelectionTarget.VIDEO) {
-                                        CanvasSelectionTarget.NONE
+                                    if (currentCanvasSelection == CanvasSelectionTarget.VIDEO) {
+                                        canvasSelection = CanvasSelectionTarget.NONE
                                     } else {
-                                        CanvasSelectionTarget.VIDEO
+                                        canvasSelection = CanvasSelectionTarget.VIDEO
+                                        val hitClip = resolveClipTimingAt(curState.clips, livePlayheadMsState.longValue)?.first
+                                            ?: curState.clips.firstOrNull()
+                                        if (hitClip != null && curState.selectedClipId != hitClip.id) {
+                                            viewModel.selectClip(hitClip.id)
+                                        }
                                     }
                                 }
                             }
@@ -745,12 +881,12 @@ fun VideoEditorWorkspace(
                                             }
                                         }
                                         CanvasSelectionTarget.VIDEO -> if (currentState.clips.isNotEmpty()) {
-                                            // Pure pinch-scale & pan on Video Frame — auto-keyframes when keyframes exist
+                                            // Pinch-scale, pan, and two-finger rotate on Video Frame — auto-keyframes when keyframes exist
                                             viewModel.adjustVideoCanvasTransform(
                                                 zoomFactor = zoom,
-                                                panDeltaX = pan.x / (w * 0.4f),
-                                                panDeltaY = pan.y / (h * 0.4f),
-                                                rotationDeltaDeg = 0f
+                                                panDeltaX = pan.x / (w * 0.5f),
+                                                panDeltaY = pan.y / (h * 0.5f),
+                                                rotationDeltaDeg = rotation
                                             )
                                         }
                                         CanvasSelectionTarget.NONE -> Unit
@@ -760,18 +896,123 @@ fun VideoEditorWorkspace(
                             .testTag("video_preview_canvas_touch_surface"),
                         contentAlignment = Alignment.Center
                     ) {
-                        if (previewBitmap != null && !previewBitmap.isRecycled) {
+                        val useGpuTransformOnBitmap = !useHardwareExo &&
+                            VideoMediaEngine.canUseGpuPreviewTransform(state, activePlayheadClip)
+
+                        // Hardware-Accelerated Media3 ExoPlayer GPU TextureView + 60fps graphicsLayer Keyframe Transform
+                        if (useHardwareExo && activePlayheadClip != null) {
+                            val srcAspect = if (activePlayheadClip.sourceWidth > 0 && activePlayheadClip.sourceHeight > 0) {
+                                activePlayheadClip.sourceWidth.toFloat() / activePlayheadClip.sourceHeight.toFloat()
+                            } else {
+                                liveSourceAspect
+                            }.coerceIn(0.25f, 4.0f)
+                            val stageAspect = (canvasW.toFloat() / canvasH.toFloat()).coerceAtLeast(0.1f)
+                            val fitW = if (stageAspect > srcAspect) canvasH * srcAspect else canvasW.toFloat()
+                            val fitH = if (stageAspect > srcAspect) canvasH.toFloat() else canvasW / srcAspect
+                            val fitWDp = with(density) { fitW.toDp() }
+                            val fitHDp = with(density) { fitH.toDp() }
+
+                            Box(
+                                modifier = Modifier
+                                    .size(width = fitWDp, height = fitHDp)
+                                    .graphicsLayer {
+                                        // Read live playhead ONLY inside graphicsLayer (zero full-screen recomposition!)
+                                        val curMs = livePlayheadMsState.longValue
+                                        val curS = currentState
+                                        val localMs = (curMs - activeClipStartMs)
+                                            .coerceIn(0L, activePlayheadClip.effectiveDurationMs)
+                                        val hasKfs = activePlayheadClip.keyframes.isNotEmpty()
+                                        val interp = if (hasKfs) {
+                                            VideoMediaEngine.interpolateKeyframes(activePlayheadClip.keyframes, localMs)
+                                        } else null
+                                        val stabBoost = if (activePlayheadClip.stabilizeEnabled) 1.09f else 1f
+                                        val baseScale = (interp?.scale ?: curS.cropZoom).coerceIn(0.25f, 4.0f)
+                                        val effScale = baseScale * stabBoost
+                                        val flipX = if (activePlayheadClip.flipH) -1f else 1f
+                                        val flipY = if (activePlayheadClip.flipV) -1f else 1f
+                                        scaleX = effScale * flipX
+                                        scaleY = effScale * flipY
+                                        val panX = interp?.xNorm ?: curS.panX
+                                        val panY = interp?.yNorm ?: curS.panY
+                                        translationX = panX * canvasW * 0.5f
+                                        translationY = panY * canvasH * 0.5f
+                                        rotationZ = interp?.rotationDeg ?: activePlayheadClip.rotationDeg
+                                        alpha = (interp?.opacity ?: 1f).coerceIn(0f, 1f)
+                                    }
+                            ) {
+                                AndroidView(
+                                    factory = { ctx ->
+                                        TextureView(ctx).apply {
+                                            isOpaque = false
+                                            exoController.attachTextureView(this)
+                                        }
+                                    },
+                                    update = { tv -> exoController.attachTextureView(tv) },
+                                    modifier = Modifier.fillMaxSize()
+                                )
+                            }
+                        } else if (previewBitmap != null && !previewBitmap.isRecycled) {
+                            // Software/Starter/LUT Preview Bitmap + unified 60fps GPU graphicsLayer Keyframe Transform
+                            val bitmapModifier = if (useGpuTransformOnBitmap && activePlayheadClip != null) {
+                                Modifier
+                                    .fillMaxSize()
+                                    .graphicsLayer {
+                                        // Read live playhead ONLY inside graphicsLayer for silky 60fps Keyframe zoom/pan/rotate/opacity
+                                        val curMs = livePlayheadMsState.longValue
+                                        val curS = currentState
+                                        val localMs = (curMs - activeClipStartMs)
+                                            .coerceIn(0L, activePlayheadClip.effectiveDurationMs)
+                                        val hasKfs = activePlayheadClip.keyframes.isNotEmpty()
+                                        val interp = if (hasKfs) {
+                                            VideoMediaEngine.interpolateKeyframes(activePlayheadClip.keyframes, localMs)
+                                        } else null
+                                        val stabBoost = if (activePlayheadClip.stabilizeEnabled) 1.09f else 1f
+                                        val baseScale = (interp?.scale ?: curS.cropZoom).coerceIn(0.25f, 4.0f)
+                                        val effScale = baseScale * stabBoost
+                                        val flipX = if (activePlayheadClip.flipH) -1f else 1f
+                                        val flipY = if (activePlayheadClip.flipV) -1f else 1f
+                                        scaleX = effScale * flipX
+                                        scaleY = effScale * flipY
+                                        val panX = interp?.xNorm ?: curS.panX
+                                        val panY = interp?.yNorm ?: curS.panY
+                                        translationX = panX * canvasW * 0.5f
+                                        translationY = panY * canvasH * 0.5f
+                                        rotationZ = interp?.rotationDeg ?: activePlayheadClip.rotationDeg
+                                        alpha = (interp?.opacity ?: 1f).coerceIn(0f, 1f)
+                                    }
+                            } else {
+                                Modifier.fillMaxSize()
+                            }
                             Image(
                                 bitmap = previewBitmap.asImageBitmap(),
                                 contentDescription = "Video Preview",
                                 contentScale = ContentScale.FillBounds,
-                                modifier = Modifier.fillMaxSize()
+                                modifier = bitmapModifier
                             )
+                        }
+
+                        // Draw-phase animated Text & Sticker overlay pass at 60fps (zero recomposition)
+                        if ((useHardwareExo || useGpuTransformOnBitmap) && activePlayheadClip != null) {
+                            Canvas(modifier = Modifier.fillMaxSize()) {
+                                val curMs = livePlayheadMsState.longValue
+                                val w = size.width.roundToInt().coerceAtLeast(1)
+                                val h = size.height.roundToInt().coerceAtLeast(1)
+                                drawIntoCanvas { canvas ->
+                                    VideoOverlayRenderer.drawOverlays(
+                                        context = context,
+                                        canvas = canvas.nativeCanvas,
+                                        activeTexts = currentState.textLayers,
+                                        playheadMs = curMs,
+                                        targetW = w,
+                                        targetH = h
+                                    )
+                                }
+                            }
                         }
                     }
 
-                    // 1. Tightly Fitted White Bounding Box for Video Frame (hugs exact zoomed-in / zoomed-out frame!)
-                    if (!isStickerCropping && canvasSelection == CanvasSelectionTarget.VIDEO && activePlayheadClip != null) {
+                    // 1. Tightly Fitted White Bounding Box for Video Frame (hugs exact zoomed-in / zoomed-out / panned frame!)
+                    if (!state.isPlaying && !isStickerCropping && canvasSelection == CanvasSelectionTarget.VIDEO && activePlayheadClip != null) {
                         val srcAspect = if (activePlayheadClip.sourceWidth > 0 && activePlayheadClip.sourceHeight > 0) {
                             activePlayheadClip.sourceWidth.toFloat() / activePlayheadClip.sourceHeight.toFloat()
                         } else {
@@ -789,29 +1030,21 @@ fun VideoEditorWorkspace(
                         }
                         val stabilizeBoost = if (activePlayheadClip.stabilizeEnabled) 1.09f else 1f
                         val baseScale = if (hasActiveVideoKeyframes) {
-                            activeKeyframeInterp.scale.coerceIn(0.25f, 3.0f)
+                            activeKeyframeInterp.scale.coerceIn(0.25f, 4.0f)
                         } else {
-                            state.cropZoom.coerceIn(0.25f, 3.0f)
+                            state.cropZoom.coerceIn(0.25f, 4.0f)
                         }
                         val basePanX = if (hasActiveVideoKeyframes) activeKeyframeInterp.xNorm else state.panX
                         val basePanY = if (hasActiveVideoKeyframes) activeKeyframeInterp.yNorm else state.panY
                         val effZoom = baseScale * stabilizeBoost
                         val drawW = fitW * effZoom
                         val drawH = fitH * effZoom
-                        val clampedCx = ImageProcessingEngine.clampFrameCenter(
-                            canvasW / 2f + basePanX * canvasW * 0.4f,
-                            drawW,
-                            canvasW.toFloat()
-                        )
-                        val clampedCy = ImageProcessingEngine.clampFrameCenter(
-                            canvasH / 2f + basePanY * canvasH * 0.4f,
-                            drawH,
-                            canvasH.toFloat()
-                        )
-                        val visLeft = (clampedCx - drawW / 2f).coerceIn(0f, canvasW.toFloat())
-                        val visRight = (clampedCx + drawW / 2f).coerceIn(visLeft, canvasW.toFloat())
-                        val visTop = (clampedCy - drawH / 2f).coerceIn(0f, canvasH.toFloat())
-                        val visBottom = (clampedCy + drawH / 2f).coerceIn(visTop, canvasH.toFloat())
+                        val centerCx = canvasW / 2f + basePanX * canvasW * 0.5f
+                        val centerCy = canvasH / 2f + basePanY * canvasH * 0.5f
+                        val visLeft = (centerCx - drawW / 2f).coerceIn(0f, canvasW.toFloat())
+                        val visRight = (centerCx + drawW / 2f).coerceIn(visLeft, canvasW.toFloat())
+                        val visTop = (centerCy - drawH / 2f).coerceIn(0f, canvasH.toFloat())
+                        val visBottom = (centerCy + drawH / 2f).coerceIn(visTop, canvasH.toFloat())
                         val boxW = (visRight - visLeft).roundToInt().coerceIn(36, canvasW)
                         val boxH = (visBottom - visTop).roundToInt().coerceIn(36, canvasH)
                         val leftPx = visLeft.roundToInt().coerceIn(0, (canvasW - boxW).coerceAtLeast(0))
@@ -827,13 +1060,16 @@ fun VideoEditorWorkspace(
                             onDeleteClick = {},
                             onDragMoveDelta = { dxPx, dyPx ->
                                 viewModel.adjustVideoCanvasTransform(
-                                    panDeltaX = dxPx / (canvasW.toFloat() * 0.4f),
-                                    panDeltaY = dyPx / (canvasH.toFloat() * 0.4f)
+                                    panDeltaX = dxPx / (canvasW.toFloat() * 0.5f),
+                                    panDeltaY = dyPx / (canvasH.toFloat() * 0.5f)
                                 )
                             },
-                            onPinchRotate = { zoom, _ ->
-                                if (zoom != 1f) {
-                                    viewModel.adjustVideoCanvasTransform(zoomFactor = zoom)
+                            onPinchRotate = { zoom, rotDeg ->
+                                if (zoom != 1f || rotDeg != 0f) {
+                                    viewModel.adjustVideoCanvasTransform(
+                                        zoomFactor = zoom,
+                                        rotationDeltaDeg = rotDeg
+                                    )
                                 }
                             },
                             onCornerScaleDelta = { deltaNorm ->
@@ -847,7 +1083,7 @@ fun VideoEditorWorkspace(
                             },
                             minCanvasEdge = minCanvasEdge,
                             tagPrefix = "video_canvas",
-                            allowPinchRotate = false,
+                            allowPinchRotate = true,
                             viewportW = canvasW,
                             viewportH = canvasH
                         )
@@ -855,6 +1091,7 @@ fun VideoEditorWorkspace(
 
                     // 2. Tightly Fitted White Bounding Box for Selected Text or Sticker Layer (hugs exact scaled & cropped bounds!)
                     if (
+                        !state.isPlaying &&
                         !isStickerCropping &&
                         selectedOverlayLayer != null &&
                         state.playheadMs in selectedOverlayLayer.startMs..selectedOverlayLayer.endMs &&
@@ -1045,13 +1282,10 @@ fun VideoEditorWorkspace(
                 }
             }
 
-            // Thin Draggable YouTube-Style Seekbar Slider synced with Center White Playhead & Live Timecode
+            // Thin Draggable YouTube-Style Seekbar Slider driven purely via graphicsLayer { ... } (0 recompositions/frame!)
             val latestTotalDurationMs by rememberUpdatedState(state.totalDurationMs)
             var isScrubbingSeekbar by remember { mutableStateOf(false) }
-            val progressFraction = if (state.totalDurationMs > 0L) {
-                (state.playheadMs.toFloat() / state.totalDurationMs.toFloat()).coerceIn(0f, 1f)
-            } else 0f
-            Box(
+            BoxWithConstraints(
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(20.dp)
@@ -1061,11 +1295,21 @@ fun VideoEditorWorkspace(
                             val down = awaitFirstDown(requireUnconsumed = true)
                             down.consume()
                             isScrubbingSeekbar = true
+                            isScrubbingAny.value = true
                             val w = size.width.coerceAtLeast(1).toFloat()
                             val startFrac = (down.position.x / w).coerceIn(0f, 1f)
                             val dur0 = latestTotalDurationMs
                             if (dur0 > 0L) {
-                                viewModel.seekPlayhead((startFrac * dur0).toLong())
+                                val target0 = (startFrac * dur0).toLong()
+                                livePlayheadMsState.longValue = target0
+                                val curS = currentState
+                                val hit0 = resolveClipTimingAt(curS.clips, target0)
+                                val canExo0 = ExoVideoPlaybackController.canUseHardwareExoSurface(curS, hit0?.first)
+                                if (canExo0 && hit0 != null) {
+                                    exoController.ensureClipLoaded(hit0.first.uriString)
+                                    exoController.seekScrub(mapLocalMsToSourceMs(hit0.first, hit0.third), force = true)
+                                }
+                                viewModel.updateLivePlayheadScrub(target0, renderSoftwarePreview = !canExo0)
                             }
                             try {
                                 do {
@@ -1077,52 +1321,69 @@ fun VideoEditorWorkspace(
                                         val frac = (change.position.x / w).coerceIn(0f, 1f)
                                         val dur = latestTotalDurationMs
                                         if (dur > 0L) {
-                                            viewModel.seekPlayhead((frac * dur).toLong())
+                                            val target = (frac * dur).toLong()
+                                            livePlayheadMsState.longValue = target
+                                            val curS = currentState
+                                            val hit = resolveClipTimingAt(curS.clips, target)
+                                            val canExo = ExoVideoPlaybackController.canUseHardwareExoSurface(curS, hit?.first)
+                                            if (canExo && hit != null) {
+                                                exoController.ensureClipLoaded(hit.first.uriString)
+                                                exoController.seekScrub(mapLocalMsToSourceMs(hit.first, hit.third))
+                                            }
+                                            viewModel.updateLivePlayheadScrub(target, renderSoftwarePreview = !canExo)
                                         }
                                     }
                                 } while (event.changes.any { it.pressed })
                             } finally {
                                 isScrubbingSeekbar = false
+                                isScrubbingAny.value = false
+                                viewModel.commitPlayheadPosition(livePlayheadMsState.longValue)
                             }
                         }
                     }
                     .testTag("video_youtube_progress_line"),
                 contentAlignment = Alignment.CenterStart
             ) {
-                Canvas(modifier = Modifier.fillMaxSize()) {
-                    val trackH = 3.dp.toPx()
-                    val cy = size.height / 2f
-                    val thumbRadius = if (isScrubbingSeekbar) 6.5.dp.toPx() else 5.dp.toPx()
-                    val activeW = (size.width * progressFraction).coerceIn(0f, size.width)
-                    // Inactive thin track
-                    drawRoundRect(
-                        color = StudioBorder.copy(alpha = 0.65f),
-                        topLeft = Offset(0f, cy - trackH / 2f),
-                        size = Size(size.width, trackH),
-                        cornerRadius = CornerRadius(trackH / 2f, trackH / 2f)
-                    )
-                    // Active cyan progress track
-                    if (activeW > 0f) {
-                        drawRoundRect(
-                            color = ElectricCyan,
-                            topLeft = Offset(0f, cy - trackH / 2f),
-                            size = Size(activeW, trackH),
-                            cornerRadius = CornerRadius(trackH / 2f, trackH / 2f)
-                        )
-                    }
-                    // Crisp YouTube-style scrub thumb
-                    val thumbX = activeW.coerceIn(thumbRadius, (size.width - thumbRadius).coerceAtLeast(thumbRadius))
-                    drawCircle(
-                        color = Color.White,
-                        radius = thumbRadius,
-                        center = Offset(thumbX, cy)
-                    )
-                    drawCircle(
-                        color = ElectricCyan,
-                        radius = (thumbRadius - 1.5.dp.toPx()).coerceAtLeast(1.5f),
-                        center = Offset(thumbX, cy)
-                    )
-                }
+                val trackWidthPx = with(density) { maxWidth.toPx() }.coerceAtLeast(1f)
+                val thumbSizeDp = if (isScrubbingSeekbar) 13.dp else 10.dp
+                val thumbSizePx = with(density) { thumbSizeDp.toPx() }
+
+                // Inactive thin track
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(3.dp)
+                        .clip(RoundedCornerShape(50))
+                        .background(StudioBorder.copy(alpha = 0.65f))
+                )
+                // Active cyan progress track scaled purely in graphicsLayer (zero recomposition!)
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(3.dp)
+                        .graphicsLayer {
+                            val dur = latestTotalDurationMs.coerceAtLeast(1L)
+                            scaleX = (livePlayheadMsState.longValue.toFloat() / dur.toFloat()).coerceIn(0f, 1f)
+                            transformOrigin = TransformOrigin(0f, 0.5f)
+                        }
+                        .clip(RoundedCornerShape(50))
+                        .background(ElectricCyan)
+                )
+                // Crisp YouTube-style scrub thumb translated purely in graphicsLayer (zero recomposition!)
+                Box(
+                    modifier = Modifier
+                        .size(thumbSizeDp)
+                        .graphicsLayer {
+                            val dur = latestTotalDurationMs.coerceAtLeast(1L)
+                            val frac = (livePlayheadMsState.longValue.toFloat() / dur.toFloat()).coerceIn(0f, 1f)
+                            translationX = ((trackWidthPx - thumbSizePx).coerceAtLeast(0f)) * frac
+                        }
+                        .clip(CircleShape)
+                        .background(Color.White)
+                        .padding(1.5.dp)
+                        .clip(CircleShape)
+                        .background(ElectricCyan)
+                )
             }
 
             // Sleek VN / YouTube Create Playbar Row: Aspect + Live Time (0.66 / 3.00) | Play/Pause | Undo (↩), Redo (↪), Loop, Freeze, Fullscreen
@@ -1170,18 +1431,9 @@ fun VideoEditorWorkspace(
                         }
                     }
 
-                    Text(
-                        text = String.format(
-                            Locale.US,
-                            "%.2f / %.2f",
-                            state.playheadMs / 1000f,
-                            state.totalDurationMs / 1000f
-                        ),
-                        style = MaterialTheme.typography.labelSmall.copy(
-                            fontWeight = FontWeight.SemiBold,
-                            fontSize = 11.sp
-                        ),
-                        color = TextPrimary,
+                    LiveVideoTimecodeText(
+                        playheadMsProvider = { livePlayheadMsState.longValue },
+                        totalDurationMs = state.totalDurationMs,
                         modifier = Modifier.testTag("video_live_timecode")
                     )
                 }
@@ -1206,43 +1458,15 @@ fun VideoEditorWorkspace(
 
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(0.dp)
+                    horizontalArrangement = Arrangement.spacedBy(2.dp)
                 ) {
-                    IconButton(
-                        onClick = { viewModel.undoVideoEdit() },
-                        enabled = canUndoVideo,
-                        modifier = Modifier
-                            .size(34.dp)
-                            .testTag("video_undo_button")
-                    ) {
-                        Icon(
-                            imageVector = Icons.AutoMirrored.Filled.Undo,
-                            contentDescription = "Undo",
-                            tint = if (canUndoVideo) Color.White else TextSecondary.copy(alpha = 0.35f),
-                            modifier = Modifier.size(18.dp)
-                        )
-                    }
-                    IconButton(
-                        onClick = { viewModel.redoVideoEdit() },
-                        enabled = canRedoVideo,
-                        modifier = Modifier
-                            .size(34.dp)
-                            .testTag("video_redo_button")
-                    ) {
-                        Icon(
-                            imageVector = Icons.AutoMirrored.Filled.Redo,
-                            contentDescription = "Redo",
-                            tint = if (canRedoVideo) Color.White else TextSecondary.copy(alpha = 0.35f),
-                            modifier = Modifier.size(18.dp)
-                        )
-                    }
                     IconButton(
                         onClick = {
                             activeTab = VideoToolTab.ENHANCE
                             isToolDrawerExpanded = true
                         },
                         modifier = Modifier
-                            .size(32.dp)
+                            .size(34.dp)
                             .testTag("video_ai_magic_quick_button")
                     ) {
                         Icon(
@@ -1254,32 +1478,32 @@ fun VideoEditorWorkspace(
                     }
                     IconButton(
                         onClick = { viewModel.toggleLoopPlayback() },
-                        modifier = Modifier.size(32.dp)
+                        modifier = Modifier.size(34.dp)
                     ) {
                         Icon(
                             imageVector = Icons.Default.Loop,
                             contentDescription = "Loop Video",
                             tint = if (state.loopPlayback) ElectricCyan else TextSecondary,
-                            modifier = Modifier.size(17.dp)
+                            modifier = Modifier.size(18.dp)
                         )
                     }
                     IconButton(
                         onClick = { viewModel.captureFreezeFrameHd() },
                         modifier = Modifier
-                            .size(32.dp)
+                            .size(34.dp)
                             .testTag("video_freeze_frame_button")
                     ) {
                         Icon(
                             imageVector = Icons.Default.CameraAlt,
                             contentDescription = "Freeze Frame HD",
                             tint = TextPrimary,
-                            modifier = Modifier.size(17.dp)
+                            modifier = Modifier.size(18.dp)
                         )
                     }
                     IconButton(
                         onClick = { isFullscreen = true },
                         modifier = Modifier
-                            .size(32.dp)
+                            .size(34.dp)
                             .testTag("video_fullscreen_toggle")
                     ) {
                         Icon(
@@ -1294,7 +1518,7 @@ fun VideoEditorWorkspace(
         }
 
         // =========================================================================
-        // 2. LOWER TIMELINE + COLLAPSIBLE DRAWER + PINNED BOTTOM TOOL BAR
+        // 2. LOWER TIMELINE + DRAGGABLE SPLIT-DIVIDER PILL (`—`) + CONTEXT-AWARE TOOLBAR
         // =========================================================================
         Surface(
             color = StudioSurface,
@@ -1302,16 +1526,67 @@ fun VideoEditorWorkspace(
             border = BorderStroke(0.5.dp, StudioBorder.copy(alpha = 0.65f)),
             modifier = Modifier
                 .fillMaxWidth()
-                .weight(if (isToolDrawerExpanded) 0.55f else 0.38f)
+                .weight((1f - clampedPreviewWeight).coerceAtLeast(0.25f))
         ) {
             Column(modifier = Modifier.fillMaxSize()) {
-                // CapCut / VN Inline Keyframe Control Strip (`<◆` | `◆+ / ◆-` | `◆>` + Easing Curve)
+                // Sleek Real-Time Draggable Split-Divider Handle Pill (`—`)
+                // Drag up/down to smoothly resize Preview Viewport across ALL aspect ratios (16:9, 9:16, 1:1, 4:5, 21:9)
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(22.dp)
+                        .pointerInput("video_split_divider_tap") {
+                            detectTapGestures(
+                                onDoubleTap = {
+                                    val snapped = if (previewWeight < 0.62f) 0.70f else 0.50f
+                                    previewWeight = snapped
+                                    if (!isToolDrawerExpanded) preDrawerPreviewWeight = snapped
+                                }
+                            )
+                        }
+                        .pointerInput(workspaceHeightPx) {
+                            detectVerticalDragGestures(
+                                onDragStart = { isDraggingSplitDivider = true },
+                                onDragEnd = {
+                                    isDraggingSplitDivider = false
+                                    if (!isToolDrawerExpanded) {
+                                        preDrawerPreviewWeight = previewWeight
+                                    }
+                                },
+                                onDragCancel = { isDraggingSplitDivider = false }
+                            ) { change, dragAmount ->
+                                change.consume()
+                                val deltaWeight = dragAmount / workspaceHeightPx
+                                val nextWeight = (previewWeight + deltaWeight).coerceIn(0.30f, 0.75f)
+                                previewWeight = nextWeight
+                                if (!isToolDrawerExpanded) {
+                                    preDrawerPreviewWeight = nextWeight
+                                }
+                            }
+                        }
+                        .testTag("video_preview_split_divider"),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .width(if (isDraggingSplitDivider) 56.dp else 42.dp)
+                            .height(4.dp)
+                            .clip(RoundedCornerShape(50))
+                            .background(
+                                if (isDraggingSplitDivider) ElectricCyan else Color.White.copy(alpha = 0.55f)
+                            )
+                    )
+                }
+
+                // CapCut / VN Inline Keyframe Control Strip (`<◆` | `◆+ / ◆-` | `◆>`)
+                // Always visible whenever a clip/overlay is selected, has keyframes, or Keyframe tab is open
                 AnimatedVisibility(
-                    visible = activeKeyframeTarget != null &&
-                        (state.selectedClipId != null ||
+                    visible = activeKeyframeTarget != null && (
+                        state.selectedClipId != null ||
                             state.selectedTextId != null ||
                             activeKeyframeTarget.keyframes.isNotEmpty() ||
-                            activeTab == VideoToolTab.KEYFRAME),
+                            activeTab == VideoToolTab.KEYFRAME
+                        ),
                     enter = expandVertically(),
                     exit = shrinkVertically()
                 ) {
@@ -1330,89 +1605,6 @@ fun VideoEditorWorkspace(
                     }
                 }
 
-                // Contextual Floating Quick-Action Bar (Hidden until a clip is tapped)
-                AnimatedVisibility(
-                    visible = isClipQuickBarVisible && state.selectedClipId != null && state.selectedClip != null,
-                    enter = expandVertically(),
-                    exit = shrinkVertically()
-                ) {
-                    Surface(
-                        color = StudioSurfaceElevated,
-                        border = BorderStroke(0.5.dp, StudioBorder),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .testTag("clip_quick_action_bar")
-                    ) {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .horizontalScroll(rememberScrollState())
-                                .padding(horizontal = 10.dp, vertical = 5.dp),
-                            horizontalArrangement = Arrangement.spacedBy(6.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            QuickActionChip(
-                                label = "Replace",
-                                icon = Icons.Default.SwapHoriz,
-                                tint = TextPrimary,
-                                testTagName = "quick_action_replace",
-                                onClick = {
-                                    replaceClipPicker.launch(
-                                        PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.VideoOnly)
-                                    )
-                                }
-                            )
-                            QuickActionChip(
-                                label = if (activeKeyframeTarget?.activeKeyframe != null && !activeKeyframeTarget.isOverlay) "Keyframe ◆-" else "Keyframe ◆+",
-                                icon = Icons.Default.Diamond,
-                                tint = ElectricCyan,
-                                testTagName = "quick_action_keyframe",
-                                onClick = {
-                                    viewModel.toggleKeyframeAtPlayhead()
-                                }
-                            )
-                            QuickActionChip(
-                                label = "Curve",
-                                icon = Icons.Default.Speed,
-                                tint = ElectricCyan,
-                                testTagName = "quick_action_curve",
-                                onClick = {
-                                    activeTab = VideoToolTab.SPEED
-                                    isToolDrawerExpanded = true
-                                }
-                            )
-                            QuickActionChip(
-                                label = "Duplicate",
-                                icon = Icons.Default.ContentCopy,
-                                tint = TextPrimary,
-                                testTagName = "quick_action_duplicate",
-                                onClick = { viewModel.duplicateSelectedClip() }
-                            )
-                            QuickActionChip(
-                                label = "Delete",
-                                icon = Icons.Default.Delete,
-                                tint = SignalRed,
-                                testTagName = "quick_action_delete",
-                                onClick = {
-                                    viewModel.deleteSelectedClip()
-                                    isClipQuickBarVisible = false
-                                }
-                            )
-                            IconButton(
-                                onClick = { isClipQuickBarVisible = false },
-                                modifier = Modifier.size(28.dp)
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.Close,
-                                    contentDescription = "Hide Clip Actions",
-                                    tint = TextSecondary,
-                                    modifier = Modifier.size(15.dp)
-                                )
-                            }
-                        }
-                    }
-                }
-
                 // Fixed-Center-Playhead Scrollable Timeline Container (Pinch-to-Zoom + Direct Drag Trim)
                 val timelineScrollState = rememberScrollState()
                 val pxPerSecBase = 46f
@@ -1425,9 +1617,12 @@ fun VideoEditorWorkspace(
                     clipWidthsDp.map { with(density) { it.dp.toPx() } }
                 }
 
-                // Sync 1: User drags/scrolls timeline -> updates playheadMs directly under fixed center white line
+                // Sync 1: User drags/scrolls timeline -> SEEK_CLOSEST_SYNC hardware scrub with zero full-screen recomposition
+                var wasTimelineScrolling by remember { mutableStateOf(false) }
                 LaunchedEffect(timelineScrollState.value, timelineScrollState.isScrollInProgress) {
                     if (timelineScrollState.isScrollInProgress && state.clips.isNotEmpty()) {
+                        wasTimelineScrolling = true
+                        isScrubbingAny.value = true
                         val scrollPx = timelineScrollState.value.toFloat()
                         var accPx = 0f
                         var accMs = 0L
@@ -1443,31 +1638,65 @@ fun VideoEditorWorkspace(
                             accPx += wPx
                             accMs += durMs
                         }
-                        if (abs(targetMs - state.playheadMs) >= 15L) {
-                            viewModel.seekPlayhead(targetMs)
+                        if (abs(targetMs - livePlayheadMsState.longValue) >= 8L) {
+                            livePlayheadMsState.longValue = targetMs
+                            val curS = currentState
+                            val hit = resolveClipTimingAt(curS.clips, targetMs)
+                            val canExo = ExoVideoPlaybackController.canUseHardwareExoSurface(curS, hit?.first)
+                            if (canExo && hit != null) {
+                                exoController.ensureClipLoaded(hit.first.uriString)
+                                exoController.seekScrub(mapLocalMsToSourceMs(hit.first, hit.third))
+                            }
+                            viewModel.updateLivePlayheadScrub(targetMs, renderSoftwarePreview = !canExo)
                         }
+                    } else if (!timelineScrollState.isScrollInProgress && wasTimelineScrolling) {
+                        wasTimelineScrolling = false
+                        isScrubbingAny.value = false
+                        viewModel.commitPlayheadPosition(livePlayheadMsState.longValue)
                     }
                 }
 
-                // Sync 2: Playback or external seek -> glides timeline smoothly past fixed center white line
-                LaunchedEffect(state.playheadMs, state.isPlaying, timelineZoom, clipWidthsPx) {
-                    if (!timelineScrollState.isScrollInProgress && state.clips.isNotEmpty()) {
-                        val targetMs = state.playheadMs
-                        var accMs = 0L
-                        var accPx = 0f
-                        var targetPx = clipWidthsPx.sum()
-                        for (i in state.clips.indices) {
-                            val durMs = state.clips[i].effectiveDurationMs.coerceAtLeast(1L)
-                            val wPx = clipWidthsPx.getOrElse(i) { 100f }
-                            if (targetMs <= accMs + durMs) {
-                                val frac = ((targetMs - accMs).toFloat() / durMs.toFloat()).coerceIn(0f, 1f)
-                                targetPx = accPx + wPx * frac
-                                break
+                // Sync 2A: Decoupled 16ms / 60fps LaunchedEffect ticker during active playback
+                // Glides timeline & syncs ExoPlayer GPU clock with zero VideoEditorWorkspace recompositions
+                LaunchedEffect(state.isPlaying, useHardwareExo, activePlayheadClip?.id, timelineZoom, clipWidthsPx) {
+                    if (!state.isPlaying || state.clips.isEmpty()) return@LaunchedEffect
+                    while (true) {
+                        val curS = currentState
+                        if (!curS.isPlaying || curS.clips.isEmpty()) break
+                        if (useHardwareExo && activePlayheadClip != null && exoController.player.isPlaying) {
+                            val srcPos = exoController.currentSourcePositionMs()
+                            val trimSpan = (activePlayheadClip.trimEndMs - activePlayheadClip.trimStartMs)
+                                .coerceAtLeast(1L)
+                            val frac = ((srcPos - activePlayheadClip.trimStartMs).toFloat() / trimSpan.toFloat())
+                                .coerceIn(0f, 1f)
+                            val exoGlobalMs = (activeClipStartMs + (activePlayheadClip.effectiveDurationMs * frac).toLong())
+                                .coerceIn(0L, curS.totalDurationMs)
+                            if (abs(exoGlobalMs - livePlayheadMsState.longValue) < 350L) {
+                                livePlayheadMsState.longValue = exoGlobalMs
                             }
-                            accMs += durMs
-                            accPx += wPx
                         }
-                        val desired = targetPx.roundToInt().coerceIn(0, timelineScrollState.maxValue)
+                        if (!timelineScrollState.isScrollInProgress && !isScrubbingAny.value) {
+                            val desired = mapTimelineMsToScrollPx(
+                                targetMs = livePlayheadMsState.longValue,
+                                clips = curS.clips,
+                                clipWidthsPx = clipWidthsPx
+                            ).roundToInt().coerceIn(0, timelineScrollState.maxValue)
+                            if (abs(timelineScrollState.value - desired) > 1) {
+                                timelineScrollState.scrollTo(desired)
+                            }
+                        }
+                        delay(16L)
+                    }
+                }
+
+                // Sync 2B: External discrete seek (when paused) -> positions timeline accurately under center playhead
+                LaunchedEffect(state.playheadMs, state.isPlaying, timelineZoom, clipWidthsPx) {
+                    if (!state.isPlaying && !timelineScrollState.isScrollInProgress && !isScrubbingAny.value && state.clips.isNotEmpty()) {
+                        val desired = mapTimelineMsToScrollPx(
+                            targetMs = state.playheadMs,
+                            clips = state.clips,
+                            clipWidthsPx = clipWidthsPx
+                        ).roundToInt().coerceIn(0, timelineScrollState.maxValue)
                         if (abs(timelineScrollState.value - desired) > 3) {
                             timelineScrollState.scrollTo(desired)
                         }
@@ -1631,20 +1860,21 @@ fun VideoEditorWorkspace(
                                             )
                                             .testTag("filmstrip_clip_$idx")
                                     ) {
+                                        val cachedThumbImages = remember(thumbs) {
+                                            thumbs.filterNot { it.isRecycled }.map { it.asImageBitmap() }
+                                        }
                                         Box(modifier = Modifier.fillMaxSize()) {
-                                            if (thumbs.isNotEmpty()) {
+                                            if (cachedThumbImages.isNotEmpty()) {
                                                 Row(modifier = Modifier.fillMaxSize()) {
-                                                    thumbs.forEach { bmp ->
-                                                        if (!bmp.isRecycled) {
-                                                            Image(
-                                                                bitmap = bmp.asImageBitmap(),
-                                                                contentDescription = null,
-                                                                contentScale = ContentScale.Crop,
-                                                                modifier = Modifier
-                                                                    .weight(1f)
-                                                                    .fillMaxHeight()
-                                                            )
-                                                        }
+                                                    cachedThumbImages.forEach { imgBmp ->
+                                                        Image(
+                                                            bitmap = imgBmp,
+                                                            contentDescription = null,
+                                                            contentScale = ContentScale.Crop,
+                                                            modifier = Modifier
+                                                                .weight(1f)
+                                                                .fillMaxHeight()
+                                                        )
                                                     }
                                                 }
                                             }
@@ -1721,15 +1951,16 @@ fun VideoEditorWorkspace(
                                                 }
                                             }
 
-                                            // Glowing Crimson/White Diamond Keyframe Markers (`◆`) at exact timestamps
+                                            // High-Visibility 14dp Glowing Crimson/White Diamond Keyframe Markers (`◆`)
+                                            // Drawn at zIndex(12f) ABOVE clip thumbnails, gradient scrim, and trim handles
                                             if (clip.keyframes.isNotEmpty()) {
                                                 TimelineKeyframeDiamondMarkers(
                                                     keyframes = clip.keyframes,
                                                     clipDurationMs = clip.effectiveDurationMs,
                                                     clipStartMs = clipStartMs,
-                                                    playheadMs = state.playheadMs,
+                                                    playheadMsProvider = { livePlayheadMsState.longValue },
                                                     clipWidthDp = clipWidthDp,
-                                                    topPaddingDp = 4.dp,
+                                                    centerYFraction = 0.42f,
                                                     tagOwnerId = clip.id,
                                                     onSelectKeyframe = { kf ->
                                                         viewModel.selectClip(clip.id)
@@ -2344,15 +2575,15 @@ fun VideoEditorWorkspace(
                                                         )
                                                     }
 
-                                                    // Glowing Crimson/White Diamond Keyframe Markers (`◆`) on Text & Sticker Bars
+                                                    // High-Visibility 14dp Glowing Crimson/White Diamond Keyframe Markers (`◆`) on Text & Sticker Bars
                                                     if (tLayer.keyframes.isNotEmpty()) {
                                                         TimelineKeyframeDiamondMarkers(
                                                             keyframes = tLayer.keyframes,
                                                             clipDurationMs = txtDurMs,
                                                             clipStartMs = tLayer.startMs,
-                                                            playheadMs = state.playheadMs,
+                                                            playheadMsProvider = { livePlayheadMsState.longValue },
                                                             clipWidthDp = txtWidthDp,
-                                                            topPaddingDp = 2.dp,
+                                                            centerYFraction = 0.50f,
                                                             tagOwnerId = tLayer.id,
                                                             onSelectKeyframe = { kf ->
                                                                 viewModel.selectVideoText(tLayer.id)
@@ -3188,7 +3419,7 @@ fun VideoEditorWorkspace(
                                 }
                             }
                             when (frameControl) {
-                                VideoFrameControl.ZOOM -> StudioSliderRow("Zoom", state.cropZoom, 0.25f..3.0f, "${(state.cropZoom * 100).roundToInt()}%") { viewModel.updateVideoFraming(zoom = it) }
+                                VideoFrameControl.ZOOM -> StudioSliderRow("Zoom", state.cropZoom, 0.25f..4.0f, "${(state.cropZoom * 100).roundToInt()}%") { viewModel.updateVideoFraming(zoom = it) }
                                 VideoFrameControl.PAN_X -> StudioSliderRow("Left / Right", state.panX, -1f..1f, "${(state.panX * 100).roundToInt()}%") { viewModel.updateVideoFraming(panX = it) }
                                 VideoFrameControl.PAN_Y -> StudioSliderRow("Up / Down", state.panY, -1f..1f, "${(state.panY * 100).roundToInt()}%") { viewModel.updateVideoFraming(panY = it) }
                                 VideoFrameControl.ROTATE -> if (clip != null) {
@@ -3351,6 +3582,22 @@ fun VideoEditorWorkspace(
                                         }
                                     }
                                 }
+                            }
+                        }
+
+                        VideoToolTab.OPACITY -> {
+                            val currentOpacity = if (hasActiveVideoKeyframes) {
+                                activeKeyframeInterp.opacity
+                            } else {
+                                activeKeyframeTarget?.currentOpacity ?: 1f
+                            }.coerceIn(0f, 1f)
+                            StudioSliderRow(
+                                label = "Clip Opacity",
+                                value = currentOpacity,
+                                valueRange = 0f..1f,
+                                displayValue = "${(currentOpacity * 100).roundToInt()}%"
+                            ) { nextOpacity ->
+                                viewModel.addOrUpdateKeyframeAtPlayhead(opacity = nextOpacity)
                             }
                         }
 
@@ -3610,19 +3857,27 @@ fun VideoEditorWorkspace(
                 }
 
                 // =========================================================================
-                // 3. SCROLLABLE BOTTOM TOOL BAR PINNED DIRECTLY ABOVE NAVIGATION BAR
+                // 3. CONTEXT-AWARE SINGLE-ROW BOTTOM TOOLBAR (YouTube Create / CapCut Style)
                 // =========================================================================
-                StudioToolTabStrip(
-                    tabs = tabs,
-                    selected = if (isToolDrawerExpanded) activeTab else VideoToolTab.NONE,
-                    onSelect = { tab ->
-                        when (tab) {
-                            VideoToolTab.SPLIT -> {
+                VideoContextBottomToolbar(
+                    isClipSelected = state.selectedClipId != null,
+                    activeTab = if (isToolDrawerExpanded) activeTab else VideoToolTab.NONE,
+                    activeFrameControl = frameControl,
+                    onDeselectClip = { clearSelectionAndCloseDrawer() },
+                    onGlobalToolClick = { tab ->
+                        if (activeTab == tab && isToolDrawerExpanded) {
+                            isToolDrawerExpanded = false
+                        } else {
+                            activeTab = tab
+                            isToolDrawerExpanded = true
+                        }
+                    },
+                    onClipToolClick = { clipTool ->
+                        when (clipTool) {
+                            ClipContextTool.SPLIT -> {
                                 viewModel.splitSelectedClipAtPlayhead()
-                                activeTab = VideoToolTab.TRIM
-                                isToolDrawerExpanded = true
                             }
-                            VideoToolTab.DELETE -> {
+                            ClipContextTool.DELETE -> {
                                 when {
                                     canvasSelection == CanvasSelectionTarget.PIP && hasActiveUserPip -> {
                                         canvasSelection = CanvasSelectionTarget.NONE
@@ -3645,21 +3900,57 @@ fun VideoEditorWorkspace(
                                     state.clips.isNotEmpty() -> {
                                         viewModel.deleteSelectedClip()
                                     }
-                                    state.audioLaneClips.isNotEmpty() -> {
-                                        viewModel.deleteSelectedVideoAudioClip()
-                                    }
-                                    state.textLayers.isNotEmpty() -> {
-                                        viewModel.deleteSelectedVideoText()
-                                    }
                                 }
                                 isClipQuickBarVisible = false
+                                isToolDrawerExpanded = false
                             }
-                            VideoToolTab.NONE -> Unit
-                            else -> {
-                                if (activeTab == tab && isToolDrawerExpanded) {
+                            ClipContextTool.SPEED -> {
+                                if (activeTab == VideoToolTab.SPEED && isToolDrawerExpanded) {
                                     isToolDrawerExpanded = false
                                 } else {
-                                    activeTab = tab
+                                    activeTab = VideoToolTab.SPEED
+                                    isToolDrawerExpanded = true
+                                }
+                            }
+                            ClipContextTool.FILTERS -> {
+                                if (activeTab == VideoToolTab.FILTER && isToolDrawerExpanded) {
+                                    isToolDrawerExpanded = false
+                                } else {
+                                    activeTab = VideoToolTab.FILTER
+                                    isToolDrawerExpanded = true
+                                }
+                            }
+                            ClipContextTool.KEYFRAME -> {
+                                if (activeTab == VideoToolTab.KEYFRAME && isToolDrawerExpanded) {
+                                    isToolDrawerExpanded = false
+                                } else {
+                                    activeTab = VideoToolTab.KEYFRAME
+                                    isToolDrawerExpanded = true
+                                }
+                            }
+                            ClipContextTool.CROP -> {
+                                if (activeTab == VideoToolTab.FRAME && frameControl == VideoFrameControl.ZOOM && isToolDrawerExpanded) {
+                                    isToolDrawerExpanded = false
+                                } else {
+                                    frameControl = VideoFrameControl.ZOOM
+                                    activeTab = VideoToolTab.FRAME
+                                    isToolDrawerExpanded = true
+                                }
+                            }
+                            ClipContextTool.ROTATE -> {
+                                if (activeTab == VideoToolTab.FRAME && frameControl == VideoFrameControl.ROTATE && isToolDrawerExpanded) {
+                                    isToolDrawerExpanded = false
+                                } else {
+                                    frameControl = VideoFrameControl.ROTATE
+                                    activeTab = VideoToolTab.FRAME
+                                    isToolDrawerExpanded = true
+                                }
+                            }
+                            ClipContextTool.OPACITY -> {
+                                if (activeTab == VideoToolTab.OPACITY && isToolDrawerExpanded) {
+                                    isToolDrawerExpanded = false
+                                } else {
+                                    activeTab = VideoToolTab.OPACITY
                                     isToolDrawerExpanded = true
                                 }
                             }
@@ -3668,5 +3959,347 @@ fun VideoEditorWorkspace(
                 )
             }
         }
+        }
     }
 }
+
+private enum class ClipContextTool(
+    val label: String,
+    val testTagKey: String
+) {
+    SPLIT("Split", "clip_tool_split"),
+    DELETE("Delete", "clip_tool_delete"),
+    SPEED("Speed", "clip_tool_speed"),
+    FILTERS("Filters", "clip_tool_filters"),
+    KEYFRAME("Keyframe", "clip_tool_keyframe"),
+    CROP("Crop", "clip_tool_crop"),
+    ROTATE("Rotate", "clip_tool_rotate"),
+    OPACITY("Opacity", "clip_tool_opacity")
+}
+
+@Composable
+private fun VideoContextBottomToolbar(
+    isClipSelected: Boolean,
+    activeTab: VideoToolTab,
+    activeFrameControl: VideoFrameControl,
+    onDeselectClip: () -> Unit,
+    onGlobalToolClick: (VideoToolTab) -> Unit,
+    onClipToolClick: (ClipContextTool) -> Unit
+) {
+    Surface(
+        color = DeepObsidian,
+        border = BorderStroke(0.5.dp, StudioBorder.copy(alpha = 0.55f)),
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("video_context_bottom_toolbar")
+    ) {
+        if (!isClipSelected) {
+            // Global single-row toolbar when NO clip is selected: Audio, Text, Stickers, Overlay, Aspect Ratio
+            val globalItems = remember {
+                listOf(
+                    Triple(VideoToolTab.AUDIO, "Audio", Icons.Default.MusicNote),
+                    Triple(VideoToolTab.TEXT, "Text", Icons.Default.Title),
+                    Triple(VideoToolTab.STICKER, "Stickers", Icons.Default.Photo),
+                    Triple(VideoToolTab.OVERLAY, "Overlay", Icons.Default.PictureInPictureAlt),
+                    Triple(VideoToolTab.FRAME, "Aspect Ratio", Icons.Default.AspectRatio)
+                )
+            }
+            BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+                val fitsCleanly = maxWidth >= 360.dp
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .then(if (fitsCleanly) Modifier else Modifier.horizontalScroll(rememberScrollState()))
+                        .padding(horizontal = 16.dp, vertical = 6.dp),
+                    horizontalArrangement = if (fitsCleanly) Arrangement.SpaceBetween else Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    globalItems.forEach { (tab, label, icon) ->
+                        val isSelected = activeTab == tab
+                        ContextToolbarButton(
+                            label = label,
+                            icon = icon,
+                            selected = isSelected,
+                            tintOverride = null,
+                            testTagName = "global_tool_${tab.name.lowercase()}",
+                            onClick = { onGlobalToolClick(tab) }
+                        )
+                    }
+                }
+            }
+        } else {
+            // Clip-Selected single-row toolbar: Left `<` Back/Deselect + scrollable uniform 64dp clip tools
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Surface(
+                    onClick = onDeselectClip,
+                    shape = RoundedCornerShape(12.dp),
+                    color = StudioSurfaceElevated,
+                    border = BorderStroke(1.dp, StudioBorder),
+                    modifier = Modifier
+                        .padding(start = 12.dp, end = 6.dp)
+                        .size(width = 40.dp, height = 52.dp)
+                        .testTag("video_toolbar_deselect_back")
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Filled.KeyboardArrowLeft,
+                            contentDescription = "Back to Global Tools",
+                            tint = Color.White,
+                            modifier = Modifier.size(24.dp)
+                        )
+                    }
+                }
+
+                Box(
+                    modifier = Modifier
+                        .width(1.dp)
+                        .height(30.dp)
+                        .background(StudioBorder.copy(alpha = 0.7f))
+                )
+
+                Row(
+                    modifier = Modifier
+                        .weight(1f)
+                        .horizontalScroll(rememberScrollState())
+                        .padding(horizontal = 8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    val clipTools = remember {
+                        listOf(
+                            ClipContextTool.SPLIT to Icons.Default.ContentCut,
+                            ClipContextTool.DELETE to Icons.Default.Delete,
+                            ClipContextTool.SPEED to Icons.Default.Speed,
+                            ClipContextTool.FILTERS to Icons.Default.FilterVintage,
+                            ClipContextTool.KEYFRAME to Icons.Default.Diamond,
+                            ClipContextTool.CROP to Icons.Default.Crop,
+                            ClipContextTool.ROTATE to Icons.AutoMirrored.Filled.RotateRight,
+                            ClipContextTool.OPACITY to Icons.Default.Opacity
+                        )
+                    }
+                    clipTools.forEach { (tool, icon) ->
+                        val isSelected = when (tool) {
+                            ClipContextTool.SPEED -> activeTab == VideoToolTab.SPEED
+                            ClipContextTool.FILTERS -> activeTab == VideoToolTab.FILTER
+                            ClipContextTool.KEYFRAME -> activeTab == VideoToolTab.KEYFRAME
+                            ClipContextTool.CROP -> activeTab == VideoToolTab.FRAME && activeFrameControl == VideoFrameControl.ZOOM
+                            ClipContextTool.ROTATE -> activeTab == VideoToolTab.FRAME && activeFrameControl == VideoFrameControl.ROTATE
+                            ClipContextTool.OPACITY -> activeTab == VideoToolTab.OPACITY
+                            else -> false
+                        }
+                        ContextToolbarButton(
+                            label = tool.label,
+                            icon = icon,
+                            selected = isSelected,
+                            tintOverride = if (tool == ClipContextTool.DELETE) SignalRed else null,
+                            testTagName = tool.testTagKey,
+                            onClick = { onClipToolClick(tool) }
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ContextToolbarButton(
+    label: String,
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    selected: Boolean,
+    tintOverride: Color?,
+    testTagName: String,
+    onClick: () -> Unit
+) {
+    val contentTint = when {
+        selected -> ElectricCyan
+        tintOverride != null -> tintOverride
+        else -> TextPrimary
+    }
+    Surface(
+        onClick = onClick,
+        shape = RoundedCornerShape(12.dp),
+        color = if (selected) ElectricCyanContainer else Color.Transparent,
+        modifier = Modifier
+            .width(64.dp)
+            .height(54.dp)
+            .testTag(testTagName)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(horizontal = 2.dp, vertical = 6.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
+        ) {
+            Icon(
+                imageVector = icon,
+                contentDescription = label,
+                tint = contentTint,
+                modifier = Modifier.size(21.dp)
+            )
+            Spacer(Modifier.height(4.dp))
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelSmall.copy(
+                    fontSize = 11.sp,
+                    fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+                    letterSpacing = (-0.25).sp
+                ),
+                color = if (selected) ElectricCyan else if (tintOverride != null) tintOverride else TextSecondary,
+                maxLines = 1,
+                softWrap = false,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+    }
+}
+
+private fun resolveClipTimingAt(
+    clips: List<com.example.model.VideoClip>,
+    timelineMs: Long
+): Triple<com.example.model.VideoClip, Long, Long>? {
+    if (clips.isEmpty()) return null
+    var acc = 0L
+    for (i in clips.indices) {
+        val clip = clips[i]
+        val dur = clip.effectiveDurationMs
+        if (timelineMs <= acc + dur || i == clips.lastIndex) {
+            return Triple(clip, acc, (timelineMs - acc).coerceIn(0L, dur))
+        }
+        acc += dur
+    }
+    return null
+}
+
+private fun mapLocalMsToSourceMs(
+    clip: com.example.model.VideoClip,
+    localMs: Long
+): Long {
+    val dur = clip.effectiveDurationMs.coerceAtLeast(1L)
+    val frac = (localMs.toFloat() / dur.toFloat()).coerceIn(0f, 1f)
+    val curvedFrac = VideoMediaEngine.remapProgressWithSpeedCurve(frac, clip.speedCurve)
+    val srcSpan = (clip.trimEndMs - clip.trimStartMs).coerceAtLeast(1L)
+    return (clip.trimStartMs + (srcSpan * curvedFrac).toLong())
+        .coerceIn(clip.trimStartMs, clip.trimEndMs.coerceAtLeast(clip.trimStartMs))
+}
+
+private fun mapTimelineMsToScrollPx(
+    targetMs: Long,
+    clips: List<com.example.model.VideoClip>,
+    clipWidthsPx: List<Float>
+): Float {
+    var accMs = 0L
+    var accPx = 0f
+    var targetPx = clipWidthsPx.sum()
+    for (i in clips.indices) {
+        val durMs = clips[i].effectiveDurationMs.coerceAtLeast(1L)
+        val wPx = clipWidthsPx.getOrElse(i) { 100f }
+        if (targetMs <= accMs + durMs) {
+            val frac = ((targetMs - accMs).toFloat() / durMs.toFloat()).coerceIn(0f, 1f)
+            targetPx = accPx + wPx * frac
+            break
+        }
+        accMs += durMs
+        accPx += wPx
+    }
+    return targetPx
+}
+
+@Composable
+private fun LiveVideoTimecodeText(
+    playheadMsProvider: () -> Long,
+    totalDurationMs: Long,
+    modifier: Modifier = Modifier
+) {
+    val curMs = playheadMsProvider()
+    Text(
+        text = String.format(
+            Locale.US,
+            "%.2f / %.2f",
+            curMs / 1000f,
+            totalDurationMs / 1000f
+        ),
+        style = MaterialTheme.typography.labelSmall.copy(
+            fontWeight = FontWeight.SemiBold,
+            fontSize = 11.sp
+        ),
+        color = TextPrimary,
+        modifier = modifier
+    )
+}
+
+@Composable
+private fun LiveFullscreenPlaybackBar(
+    playheadMsProvider: () -> Long,
+    totalDurationMs: Long,
+    isPlaying: Boolean,
+    loopPlayback: Boolean,
+    onScrubTo: (Long) -> Unit,
+    onScrubFinished: () -> Unit,
+    onTogglePlay: () -> Unit,
+    onToggleLoop: () -> Unit
+) {
+    val curMs = playheadMsProvider()
+    Column(
+        modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp)
+    ) {
+        Slider(
+            value = curMs.toFloat().coerceIn(0f, totalDurationMs.toFloat().coerceAtLeast(1000f)),
+            onValueChange = { onScrubTo(it.toLong()) },
+            onValueChangeFinished = onScrubFinished,
+            valueRange = 0f..totalDurationMs.toFloat().coerceAtLeast(1000f),
+            colors = SliderDefaults.colors(
+                thumbColor = ElectricCyan,
+                activeTrackColor = ElectricCyan,
+                inactiveTrackColor = StudioBorder
+            ),
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(22.dp)
+        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = "${formatSimpleTime(curMs)} / ${formatSimpleTime(totalDurationMs)}",
+                style = MaterialTheme.typography.labelMedium,
+                color = ElectricCyan
+            )
+            Surface(
+                onClick = onTogglePlay,
+                shape = CircleShape,
+                color = ElectricCyan,
+                modifier = Modifier.size(48.dp)
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Icon(
+                        imageVector = if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
+                        contentDescription = if (isPlaying) "Pause" else "Play",
+                        tint = Color.White,
+                        modifier = Modifier.size(28.dp)
+                    )
+                }
+            }
+            IconButton(
+                onClick = onToggleLoop,
+                modifier = Modifier.size(44.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Loop,
+                    contentDescription = "Loop Video",
+                    tint = if (loopPlayback) ElectricCyan else TextSecondary
+                )
+            }
+        }
+    }
+}
+

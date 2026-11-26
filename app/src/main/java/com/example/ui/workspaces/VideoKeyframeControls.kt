@@ -183,18 +183,20 @@ fun resolveActiveKeyframeTarget(state: VideoEditorState): ActiveKeyframeTargetIn
 }
 
 /**
- * Draws glowing crimson/white diamond markers (`◆`) directly on a Video, Text, or Sticker
- * timeline clip at each Keyframe's exact time position, plus a subtle glowing connector line
- * between consecutive Keyframes.
+ * Draws high-visibility glowing crimson/white diamond markers (`◆`) (`14.dp` visual diamond
+ * with crisp white border + crimson radial glow halo) directly on a Video, Text, or Sticker
+ * timeline clip at each Keyframe's exact millisecond timestamp, ABOVE clip thumbnails and
+ * trim handles (`zIndex(12f)`). Reads [playheadMsProvider] strictly inside `Canvas` draw phase
+ * for zero-recomposition 60fps highlighting.
  */
 @Composable
 fun TimelineKeyframeDiamondMarkers(
     keyframes: List<VideoKeyframe>,
     clipDurationMs: Long,
     clipStartMs: Long,
-    playheadMs: Long,
+    playheadMsProvider: () -> Long,
     clipWidthDp: Dp,
-    topPaddingDp: Dp = 3.dp,
+    centerYFraction: Float = 0.44f,
     tagOwnerId: String,
     onSelectKeyframe: (VideoKeyframe) -> Unit,
     modifier: Modifier = Modifier
@@ -204,68 +206,82 @@ fun TimelineKeyframeDiamondMarkers(
     val sorted = keyframes.sortedBy { it.timeMs }
     val safeDur = clipDurationMs.coerceAtLeast(1L).toFloat()
     val clipWpx = with(density) { clipWidthDp.toPx() }.coerceAtLeast(1f)
-    val markerSizeDp = 15.dp
-    val markerPx = with(density) { markerSizeDp.toPx() }
-    val topPx = with(density) { topPaddingDp.toPx() }
+    // 24dp unclipped glow & touch container housing a crisp 14.dp tip-to-tip diamond (`r = 7.dp`)
+    val hitBoxDp = 24.dp
+    val hitBoxPx = with(density) { hitBoxDp.toPx() }
+    val diamondRadiusPx = with(density) { 7.dp.toPx() }
+    val borderStrokePx = with(density) { 2.dp.toPx() }
+    val edgeInsetPx = with(density) { 10.dp.toPx() }.coerceAtMost(clipWpx / 2f)
 
-    Box(modifier = modifier.fillMaxSize()) {
-        // Glowing crimson animation span line connecting consecutive Keyframes
+    Box(
+        modifier = modifier
+            .fillMaxSize()
+            .zIndex(12f)
+    ) {
+        // Glowing crimson/white animation span rail connecting consecutive Keyframes
         if (sorted.size >= 2) {
             Canvas(
                 modifier = Modifier
                     .fillMaxSize()
-                    .zIndex(5.5f)
+                    .zIndex(12f)
             ) {
-                val yCenter = topPx + markerPx / 2f
+                val yCenter = size.height * centerYFraction
                 val firstFrac = (sorted.first().timeMs.toFloat() / safeDur).coerceIn(0f, 1f)
                 val lastFrac = (sorted.last().timeMs.toFloat() / safeDur).coerceIn(0f, 1f)
-                val x1 = (clipWpx * firstFrac).coerceIn(markerPx / 2f, (clipWpx - markerPx / 2f).coerceAtLeast(markerPx / 2f))
-                val x2 = (clipWpx * lastFrac).coerceIn(x1, (clipWpx - markerPx / 2f).coerceAtLeast(x1))
+                val maxX = (clipWpx - edgeInsetPx).coerceAtLeast(edgeInsetPx)
+                val x1 = (clipWpx * firstFrac).coerceIn(edgeInsetPx, maxX)
+                val x2 = (clipWpx * lastFrac).coerceIn(x1, maxX)
                 drawLine(
                     brush = Brush.horizontalGradient(
                         listOf(
-                            ElectricCyan.copy(alpha = 0.75f),
-                            Color.White.copy(alpha = 0.90f),
-                            ElectricCyan.copy(alpha = 0.75f)
+                            ElectricCyan.copy(alpha = 0.90f),
+                            Color.White.copy(alpha = 0.95f),
+                            ElectricCyan.copy(alpha = 0.90f)
                         )
                     ),
                     start = Offset(x1, yCenter),
                     end = Offset(x2, yCenter),
-                    strokeWidth = 2.2.dp.toPx(),
+                    strokeWidth = 2.5.dp.toPx(),
                     cap = StrokeCap.Round
                 )
             }
         }
 
-        // Individual glowing crimson/white diamond markers (`◆`)
+        // Individual 14.dp high-visibility glowing crimson/white diamond markers (`◆`)
         sorted.forEach { kf ->
             val frac = (kf.timeMs.toFloat() / safeDur).coerceIn(0f, 1f)
-            val xPx = (clipWpx * frac - markerPx / 2f)
-                .roundToInt()
-                .coerceIn(0, (clipWpx - markerPx).roundToInt().coerceAtLeast(0))
-            val isAtPlayhead = abs((clipStartMs + kf.timeMs) - playheadMs) <= 65L
+            val maxCenterX = (clipWpx - edgeInsetPx).coerceAtLeast(edgeInsetPx)
+            val centerXPx = (clipWpx * frac).coerceIn(edgeInsetPx, maxCenterX)
+            val leftXPx = (centerXPx - hitBoxPx / 2f).roundToInt()
 
             Box(
                 modifier = Modifier
-                    .align(Alignment.TopStart)
-                    .offset { IntOffset(xPx, topPx.roundToInt()) }
-                    .size(markerSizeDp)
-                    .zIndex(7f)
+                    .align(Alignment.CenterStart)
+                    .offset {
+                        // Place diamond cleanly above bottom text label using vertical bias
+                        val yBiasShiftPx = ((centerYFraction - 0.5f) * 48f * density.density).roundToInt()
+                        IntOffset(leftXPx, yBiasShiftPx)
+                    }
+                    .size(hitBoxDp)
+                    .zIndex(13f)
                     .clickable { onSelectKeyframe(kf) }
                     .testTag("keyframe_marker_${tagOwnerId}_${kf.id}"),
                 contentAlignment = Alignment.Center
             ) {
                 Canvas(modifier = Modifier.fillMaxSize()) {
+                    val curPlayheadMs = playheadMsProvider()
+                    val isAtPlayhead = abs((clipStartMs + kf.timeMs) - curPlayheadMs) <= 65L
                     val cx = size.width / 2f
                     val cy = size.height / 2f
-                    val r = size.minDimension * 0.40f
-                    val glowR = size.minDimension * 0.56f
+                    val r = diamondRadiusPx.coerceAtMost(size.minDimension * 0.42f)
+                    val glowR = size.minDimension * 0.50f
 
-                    // Outer crimson glow halo
+                    // Bright outer crimson/white glow halo so diamonds pop unmistakably over any thumbnail
                     drawCircle(
                         brush = Brush.radialGradient(
                             colors = listOf(
-                                ElectricCyan.copy(alpha = if (isAtPlayhead) 0.95f else 0.65f),
+                                if (isAtPlayhead) Color.White.copy(alpha = 0.95f) else ElectricCyan.copy(alpha = 0.85f),
+                                ElectricCyan.copy(alpha = if (isAtPlayhead) 0.55f else 0.30f),
                                 Color.Transparent
                             ),
                             center = Offset(cx, cy),
@@ -282,7 +298,20 @@ fun TimelineKeyframeDiamondMarkers(
                         lineTo(cx - r, cy)
                         close()
                     }
-                    // Active at playhead = glowing white core + crimson rim; resting = vivid crimson core + crisp white rim
+                    // Dark subtle drop backing for razor-sharp contrast over bright white thumbnails
+                    val shadowDiamond = Path().apply {
+                        val sr = r + 1.5.dp.toPx()
+                        moveTo(cx, cy - sr)
+                        lineTo(cx + sr, cy)
+                        lineTo(cx, cy + sr)
+                        lineTo(cx - sr, cy)
+                        close()
+                    }
+                    drawPath(
+                        path = shadowDiamond,
+                        color = OledBlack.copy(alpha = 0.65f)
+                    )
+                    // Active at playhead = glowing white core + crimson rim; resting = vivid crimson core + crisp 2dp white rim
                     drawPath(
                         path = diamond,
                         color = if (isAtPlayhead) Color.White else ElectricCyan
@@ -290,7 +319,7 @@ fun TimelineKeyframeDiamondMarkers(
                     drawPath(
                         path = diamond,
                         color = if (isAtPlayhead) ElectricCyan else Color.White,
-                        style = Stroke(width = 1.6.dp.toPx())
+                        style = Stroke(width = borderStrokePx)
                     )
                 }
             }
@@ -777,15 +806,18 @@ fun ProKeyframeDrawerPanel(
         }
 
         when (activeProp) {
-            ProKeyframeProperty.SCALE -> StudioSliderRow(
-                label = "Keyframe Scale",
-                value = target.currentScale,
-                valueRange = 0.25f..2.6f,
-                displayValue = "${(target.currentScale * 100).roundToInt()}%"
-            ) { v -> onUpdateTransform(null, null, v, null, null) }
+            ProKeyframeProperty.SCALE -> {
+                val maxScale = if (target.isOverlay) 3.0f else 4.0f
+                StudioSliderRow(
+                    label = "Keyframe Scale",
+                    value = target.currentScale.coerceIn(0.25f, maxScale),
+                    valueRange = 0.25f..maxScale,
+                    displayValue = "${(target.currentScale * 100).roundToInt()}%"
+                ) { v -> onUpdateTransform(null, null, v, null, null) }
+            }
 
             ProKeyframeProperty.POS_X -> {
-                val range = if (target.isOverlay) 0.04f..0.96f else -0.8f..0.8f
+                val range = if (target.isOverlay) 0.04f..0.96f else -1.0f..1.0f
                 val displayPct = if (target.isOverlay) {
                     "${((target.currentX - 0.5f) * 200f).roundToInt()}%"
                 } else {
@@ -800,7 +832,7 @@ fun ProKeyframeDrawerPanel(
             }
 
             ProKeyframeProperty.POS_Y -> {
-                val range = if (target.isOverlay) 0.04f..0.96f else -0.8f..0.8f
+                val range = if (target.isOverlay) 0.04f..0.96f else -1.0f..1.0f
                 val displayPct = if (target.isOverlay) {
                     "${((target.currentY - 0.5f) * 200f).roundToInt()}%"
                 } else {

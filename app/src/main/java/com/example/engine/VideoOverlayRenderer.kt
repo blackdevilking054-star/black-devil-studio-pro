@@ -453,8 +453,19 @@ object VideoOverlayRenderer {
         val destRect = RectF(-drawW / 2f, -drawH / 2f, drawW / 2f, drawH / 2f)
 
         if (!stk.stickerImageUri.isNullOrBlank()) {
-            val maxDim = max(drawW, drawH).roundToInt().coerceIn(128, 768)
-            val bmp = ImageProcessingEngine.decodeSampledBitmap(context, stk.stickerImageUri, null, maxDim)
+            val rawMaxDim = max(drawW, drawH).roundToInt()
+            val bucketMaxDim = when {
+                rawMaxDim <= 256 -> 256
+                rawMaxDim <= 512 -> 512
+                rawMaxDim <= 768 -> 768
+                else -> ImageProcessingEngine.MAX_PREVIEW_DIMENSION_PX
+            }
+            val bmp = ImageProcessingEngine.decodeSampledBitmap(
+                context = context,
+                uriString = stk.stickerImageUri,
+                fallbackDrawable = null,
+                maxDimension = bucketMaxDim
+            )
             if (bmp != null && !bmp.isRecycled) {
                 val srcRect = Rect(
                     (bmp.width * cropL).roundToInt().coerceIn(0, bmp.width - 1),

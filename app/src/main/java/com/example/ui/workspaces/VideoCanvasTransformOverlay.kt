@@ -114,11 +114,55 @@ internal fun BoxScope.InteractiveWhiteTransformBox(
     val totalH = clampedH + handleTopExtraPx + handlePadPx
     val boxCenterYNorm = (handleTopExtraPx + clampedH / 2f) / totalH.coerceAtLeast(1).toFloat()
 
-    // Keep handles flush along the exact white bounding box border without clipping outside viewport
-    val cornerInsetDp = if (boundedToViewport) (-6).dp else (-17).dp
-    val cornerOutsetDp = if (boundedToViewport) 6.dp else 17.dp
-    val sideInsetDp = if (boundedToViewport) (-6).dp else (-14).dp
-    val sideOutsetDp = if (boundedToViewport) 6.dp else 14.dp
+    // Keep all 8 handles (4 corners + 4 edges) crisp, visible, and grabbable even when
+    // scaled all the way to 100% full-screen fill inside a clipped viewport.
+    val edgeMarginPx = with(density) { 10.dp.roundToPx() }
+    val nearLeftEdge = boundedToViewport && clampedLeft < edgeMarginPx
+    val nearRightEdge = boundedToViewport && (viewportW - (clampedLeft + clampedW)) < edgeMarginPx
+    val nearTopEdge = boundedToViewport && clampedTop < edgeMarginPx
+    val nearBottomEdge = boundedToViewport && (viewportH - (clampedTop + clampedH)) < edgeMarginPx
+
+    val cornerLeftOffsetDp = when {
+        !boundedToViewport -> (-17).dp
+        nearLeftEdge -> 4.dp
+        else -> (-6).dp
+    }
+    val cornerRightOffsetDp = when {
+        !boundedToViewport -> 17.dp
+        nearRightEdge -> (-4).dp
+        else -> 6.dp
+    }
+    val cornerTopOffsetDp = when {
+        !boundedToViewport -> (-17).dp
+        nearTopEdge -> 4.dp
+        else -> (-6).dp
+    }
+    val cornerBottomOffsetDp = when {
+        !boundedToViewport -> 17.dp
+        nearBottomEdge -> (-4).dp
+        else -> 6.dp
+    }
+
+    val sideLeftOffsetDp = when {
+        !boundedToViewport -> (-14).dp
+        nearLeftEdge -> 3.dp
+        else -> (-5).dp
+    }
+    val sideRightOffsetDp = when {
+        !boundedToViewport -> 14.dp
+        nearRightEdge -> (-3).dp
+        else -> 5.dp
+    }
+    val sideTopOffsetDp = when {
+        !boundedToViewport -> (-14).dp
+        nearTopEdge -> 3.dp
+        else -> (-5).dp
+    }
+    val sideBottomOffsetDp = when {
+        !boundedToViewport -> 14.dp
+        nearBottomEdge -> (-3).dp
+        else -> 5.dp
+    }
 
     Box(
         modifier = Modifier
@@ -377,10 +421,10 @@ internal fun BoxScope.InteractiveWhiteTransformBox(
                 }
             }
 
-            // Side Edge Resize Handles aligned cleanly along Left, Right, Top, and Bottom outer edges
+            // 4 Side Edge Pill Resize Handles aligned cleanly along Left, Right, Top, and Bottom edges
             SideResizeHandle(
                 alignment = Alignment.CenterStart,
-                offsetX = sideInsetDp,
+                offsetX = sideLeftOffsetDp,
                 offsetY = 0.dp,
                 isHorizontalBar = false,
                 signX = -1f,
@@ -391,7 +435,7 @@ internal fun BoxScope.InteractiveWhiteTransformBox(
             )
             SideResizeHandle(
                 alignment = Alignment.CenterEnd,
-                offsetX = sideOutsetDp,
+                offsetX = sideRightOffsetDp,
                 offsetY = 0.dp,
                 isHorizontalBar = false,
                 signX = 1f,
@@ -403,7 +447,7 @@ internal fun BoxScope.InteractiveWhiteTransformBox(
             SideResizeHandle(
                 alignment = Alignment.TopCenter,
                 offsetX = 0.dp,
-                offsetY = sideInsetDp,
+                offsetY = sideTopOffsetDp,
                 isHorizontalBar = true,
                 signX = 0f,
                 signY = -1f,
@@ -414,7 +458,7 @@ internal fun BoxScope.InteractiveWhiteTransformBox(
             SideResizeHandle(
                 alignment = Alignment.BottomCenter,
                 offsetX = 0.dp,
-                offsetY = sideOutsetDp,
+                offsetY = sideBottomOffsetDp,
                 isHorizontalBar = true,
                 signX = 0f,
                 signY = 1f,
@@ -423,11 +467,11 @@ internal fun BoxScope.InteractiveWhiteTransformBox(
                 onScaleDelta = { currentOnScale(it) }
             )
 
-            // Corner 1: Top-Left Drag Resize Handle
+            // Corner 1: Top-Left White Circular Resize Handle
             CornerResizeHandle(
                 alignment = Alignment.TopStart,
-                offsetX = cornerInsetDp,
-                offsetY = cornerInsetDp,
+                offsetX = cornerLeftOffsetDp,
+                offsetY = cornerTopOffsetDp,
                 signX = -1f,
                 signY = -1f,
                 minCanvasEdge = minCanvasEdge,
@@ -435,7 +479,7 @@ internal fun BoxScope.InteractiveWhiteTransformBox(
                 onScaleDelta = { currentOnScale(it) }
             )
 
-            // Corner 2: Top-Right (Red "X" Delete button for PIP, or White Corner Resize Handle)
+            // Corner 2: Top-Right (Red "X" Delete button for PIP/Text/Sticker, or White Corner Resize Handle)
             if (showDeleteX) {
                 Surface(
                     onClick = onDeleteClick,
@@ -445,8 +489,8 @@ internal fun BoxScope.InteractiveWhiteTransformBox(
                     modifier = Modifier
                         .align(Alignment.TopEnd)
                         .offset(
-                            x = if (boundedToViewport) 4.dp else 14.dp,
-                            y = if (boundedToViewport) (-4).dp else (-14).dp
+                            x = if (boundedToViewport) (-2).dp else 14.dp,
+                            y = if (boundedToViewport) 2.dp else (-14).dp
                         )
                         .size(26.dp)
                         .zIndex(12f)
@@ -464,8 +508,8 @@ internal fun BoxScope.InteractiveWhiteTransformBox(
             } else {
                 CornerResizeHandle(
                     alignment = Alignment.TopEnd,
-                    offsetX = cornerOutsetDp,
-                    offsetY = cornerInsetDp,
+                    offsetX = cornerRightOffsetDp,
+                    offsetY = cornerTopOffsetDp,
                     signX = 1f,
                     signY = -1f,
                     minCanvasEdge = minCanvasEdge,
@@ -474,11 +518,11 @@ internal fun BoxScope.InteractiveWhiteTransformBox(
                 )
             }
 
-            // Corner 3: Bottom-Left Drag Resize Handle
+            // Corner 3: Bottom-Left White Circular Resize Handle
             CornerResizeHandle(
                 alignment = Alignment.BottomStart,
-                offsetX = cornerInsetDp,
-                offsetY = cornerOutsetDp,
+                offsetX = cornerLeftOffsetDp,
+                offsetY = cornerBottomOffsetDp,
                 signX = -1f,
                 signY = 1f,
                 minCanvasEdge = minCanvasEdge,
@@ -486,11 +530,11 @@ internal fun BoxScope.InteractiveWhiteTransformBox(
                 onScaleDelta = { currentOnScale(it) }
             )
 
-            // Corner 4: Bottom-Right Drag Resize Handle
+            // Corner 4: Bottom-Right White Circular Resize Handle
             CornerResizeHandle(
                 alignment = Alignment.BottomEnd,
-                offsetX = cornerOutsetDp,
-                offsetY = cornerOutsetDp,
+                offsetX = cornerRightOffsetDp,
+                offsetY = cornerBottomOffsetDp,
                 signX = 1f,
                 signY = 1f,
                 minCanvasEdge = minCanvasEdge,
@@ -519,7 +563,7 @@ private fun BoxScope.SideResizeHandle(
         modifier = Modifier
             .align(alignment)
             .offset(x = offsetX, y = offsetY)
-            .size(28.dp)
+            .size(36.dp)
             .zIndex(9f)
             .pointerInput(tag) {
                 detectDragGestures { change, dragAmount ->
@@ -531,16 +575,16 @@ private fun BoxScope.SideResizeHandle(
             .testTag(tag),
         contentAlignment = Alignment.Center
     ) {
-        Box(
-            modifier = Modifier
-                .size(
-                    width = if (isHorizontalBar) 20.dp else 6.dp,
-                    height = if (isHorizontalBar) 6.dp else 20.dp
-                )
-                .clip(RoundedCornerShape(3.dp))
-                .background(Color.White)
-                .border(1.2.dp, OledBlack.copy(alpha = 0.8f), RoundedCornerShape(3.dp))
-        )
+        Surface(
+            shape = RoundedCornerShape(4.dp),
+            color = Color.White,
+            border = BorderStroke(1.3.dp, OledBlack.copy(alpha = 0.85f)),
+            shadowElevation = 2.dp,
+            modifier = Modifier.size(
+                width = if (isHorizontalBar) 22.dp else 6.dp,
+                height = if (isHorizontalBar) 6.dp else 22.dp
+            )
+        ) {}
     }
 }
 
@@ -560,25 +604,25 @@ private fun BoxScope.CornerResizeHandle(
         modifier = Modifier
             .align(alignment)
             .offset(x = offsetX, y = offsetY)
-            .size(34.dp)
+            .size(40.dp)
             .zIndex(10f)
             .pointerInput(tag) {
                 detectDragGestures { change, dragAmount ->
                     change.consume()
-                    val deltaNorm = (dragAmount.x * signX + dragAmount.y * signY) / (minCanvasEdge * 0.72f)
+                    val deltaNorm = (dragAmount.x * signX + dragAmount.y * signY) / (minCanvasEdge * 0.68f)
                     currentOnScale(deltaNorm)
                 }
             }
             .testTag(tag),
         contentAlignment = Alignment.Center
     ) {
-        Box(
-            modifier = Modifier
-                .size(13.dp)
-                .clip(CircleShape)
-                .background(Color.White)
-                .border(1.6.dp, OledBlack.copy(alpha = 0.8f), CircleShape)
-        )
+        Surface(
+            shape = CircleShape,
+            color = Color.White,
+            border = BorderStroke(1.6.dp, OledBlack.copy(alpha = 0.85f)),
+            shadowElevation = 3.dp,
+            modifier = Modifier.size(14.dp)
+        ) {}
     }
 }
 
