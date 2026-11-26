@@ -361,11 +361,16 @@ object AppSecurityFirewall {
         }
     }
 
+    const val APP_DOWNLOAD_URL = "https://github.com/blackdevilking054-star/black-devil-studio-pro/releases/latest"
+
+    fun buildReferAndShareInviteText(): String =
+        "I'm creating 4K videos, viral thumbnails, and pro sound mixes with Black Devil Studio Pro — completely free with zero watermarks! " +
+            "Try Black Devil Studio Pro for your YouTube videos, Shorts, and Instagram Reels.\n\n" +
+            "Download APK here:\n" +
+            APP_DOWNLOAD_URL
+
     fun launchReferAndShareIntent(context: Context) {
-        val inviteText = buildString {
-            append("I'm creating 4K videos, viral thumbnails, and pro sound mixes with Black Devil Studio Pro — completely free with zero watermarks! ")
-            append("Try Black Devil Studio Pro for your YouTube videos, Shorts, and Instagram Reels.")
-        }
+        val inviteText = buildReferAndShareInviteText()
         val sendIntent = Intent(Intent.ACTION_SEND).apply {
             type = "text/plain"
             putExtra(Intent.EXTRA_SUBJECT, "Try Black Devil Studio Pro")
